@@ -165,6 +165,15 @@ class FstWriter:
         return bytes(result)
 
     def _build_header(self) -> bytes:
+        # vc_section_count must match the number of VCDATA blocks that will
+        # be written. fst2vcd refuses to open a file (`Could not open ...`)
+        # when this is non-zero but no VCDATA block follows -- the C reader
+        # at fstapi.c:4898 requires `vc_section_count > 0` as part of the
+        # "header looks usable" check, but it also overrides the field after
+        # actually scanning blocks. Writing 1 for an empty file gets us the
+        # worst of both: the override sets it to 0, and the success check
+        # then fails.
+        vc_section_count = 1 if self._vc_records else 0
         buf = bytearray()
         buf.extend(struct.pack(">Q", self.start_time))
         buf.extend(struct.pack(">Q", self._end_time))
@@ -173,7 +182,7 @@ class FstWriter:
         buf.extend(struct.pack(">Q", self._scope_count))
         buf.extend(struct.pack(">Q", self._handle_counter))
         buf.extend(struct.pack(">Q", self._handle_counter))
-        buf.extend(struct.pack(">Q", 1))
+        buf.extend(struct.pack(">Q", vc_section_count))
         ts_byte = self.timescale & 0xFF
         if ts_byte >= 128:
             ts_byte -= 256
@@ -187,13 +196,26 @@ class FstWriter:
         return bytes(buf)
 
     def _build_geometry_block(self) -> bytes:
+        # Geometry varint convention used by the libfst reader
+        # (fstapi.c:4781-4791) and writer (fstapi.c:2688-2695):
+        #     0          → 8-byte FST_VT_VCD_REAL (double)
+        #     0xFFFFFFFF → variable-length string (FST_VT_GEN_STRING)
+        #     N (other)  → N-bit signal
+        # The previous implementation had the two special cases swapped, so a
+        # var created with is_string=True wrote geom=0 (reader thinks: real,
+        # length 8), and a normal var declared with length=0 wrote
+        # geom=0xFFFFFFFF (reader thinks: string). Anyone calling create_var
+        # with is_string=True would see fst2vcd emit an empty `$var string 0`
+        # with no dumped values.
         geom_data = bytearray()
         for h in range(1, self._handle_counter + 1):
             vi = self._vars.get(h)
-            if vi is None or vi.is_string:
-                geom_data.extend(write_varint(0))
-            elif vi.length == 0:
+            if vi is None:
+                geom_data.extend(write_varint(0xFFFFFFFF))  # unknown → treat as string
+            elif vi.is_string:
                 geom_data.extend(write_varint(0xFFFFFFFF))
+            elif vi.length == 0:
+                geom_data.extend(write_varint(0))            # real
             else:
                 geom_data.extend(write_varint(vi.length))
         compressed = zlib.compress(bytes(geom_data))
@@ -290,14 +312,16 @@ class FstWriter:
         # Concatenate VC payloads and build chain table
         vc_payload = bytearray()
         chunk_offsets: list[int] = []
+        signals_present: list[bool] = []
         for h in range(1, max_handle + 1):
             chunk = handle_chunks.get(h, b"")
             chunk_offsets.append(len(vc_payload))
+            signals_present.append(bool(chunk))
             if chunk:
                 # Prepend varint(0) = uncompressed marker
                 vc_payload.append(0)
                 vc_payload.extend(chunk)
-        chain_cmem = self._build_chain_table(chunk_offsets, len(vc_payload))
+        chain_cmem = self._build_chain_table(chunk_offsets, signals_present)
 
         # Time table
         time_table_raw = bytearray()
@@ -342,28 +366,47 @@ class FstWriter:
         header.extend(struct.pack(">Q", total_len))
         return [bytes(header) + bytes(block_body)]
 
-    def _build_chain_table(self, chunk_offsets: list[int], total_len: int) -> bytes:
-        """Build chain table encoding byte offsets into VC data area.
-        
-        Offsets are relative to pack_type position (vc_start), NOT VC data start.
-        Since VC data starts 1 byte after pack_type, we add 1 to all offsets.
+    def _build_chain_table(self, chunk_offsets: list[int],
+                            signals_present: list[bool]) -> bytes:
+        """Build chain table per the libfst block-1 / DYN_ALIAS encoding.
 
-        Important: the chain stream contains ONE varint per signal, no sentinel.
-        libfst's reader computes the trailing sentinel as `indx_pos - vc_start`
-        (fstapi.c:5474). Emitting an explicit sentinel here would make the
-        reader write past chain_table[vc_maxhandle], which is sized
-        calloc(vc_maxhandle+1, ...).
+        Three varint shapes recognised by the reader:
+          - `(loopcnt << 1)`             (bit 0 = 0): N consecutive empty
+                                          signals -- chain_table[i] = 0,
+                                          reader yields only the frame value.
+          - `(delta << 1) | 1`           (bit 0 = 1): signal *has* data;
+                                          chain_table[i] = previous + delta.
+                                          The first such delta is the absolute
+                                          offset from `vc_start` (= position
+                                          of the pack_type byte).
+          - `0; varint(-len)`            (alias-to-prior): unused by this
+                                          writer because we never share data.
+
+        Without the zero-skip case, signals declared via create_var but never
+        emitted got a `(0 << 1) | 1 = 1` entry, which the C reader at
+        `fstapi.c:5457` interpreted as "another chunk at the same offset".
+        It then went to read that chunk's varint header, walked into the
+        chain data, and aborted (`fst2vcd: Could not open ...`).
+
+        The trailing sentinel is still computed by the reader as
+        `indx_pos - vc_start`; we do NOT emit it.
         """
         result = bytearray()
         pval = 0
-        for i, off in enumerate(chunk_offsets):
-            abs_off = off + 1  # +1 for pack_type byte
-            if i == 0:
-                result.extend(write_varint((abs_off << 1) | 1))
-            else:
-                delta = abs_off - pval
-                result.extend(write_varint((delta << 1) | 1))
+        zerocnt = 0
+        for i, has_data in enumerate(signals_present):
+            if not has_data:
+                zerocnt += 1
+                continue
+            if zerocnt:
+                result.extend(write_varint(zerocnt << 1))
+                zerocnt = 0
+            abs_off = chunk_offsets[i] + 1  # +1 for pack_type byte
+            delta = abs_off - pval
+            result.extend(write_varint((delta << 1) | 1))
             pval = abs_off
+        if zerocnt:
+            result.extend(write_varint(zerocnt << 1))
         return bytes(result)
 
     @staticmethod

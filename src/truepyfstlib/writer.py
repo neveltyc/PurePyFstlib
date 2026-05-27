@@ -17,7 +17,8 @@ import zlib
 from .common import (
     FstBlockType, FstScopeType, FstVarType, FstVarDir, FstFileType,
     FstWriterPackType,
-    FST_BL_HDR, FST_BL_VCDATA, FST_BL_GEOM, FST_BL_HIER,
+    FST_BL_HDR, FST_BL_VCDATA, FST_BL_GEOM, FST_BL_HIER, FST_BL_BLACKOUT,
+    FST_ST_GEN_ATTRBEGIN, FST_ST_GEN_ATTREND,
     FST_ST_VCD_SCOPE, FST_ST_VCD_UPSCOPE,
     FST_HDR_SIM_VERSION_SIZE, FST_HDR_DATE_SIZE, FST_DOUBLE_ENDTEST,
     FST_RCV_STR,
@@ -69,9 +70,11 @@ class FstWriter:
         self._scope_count = 0
         self._hier_events: list[bytes] = []
         self._vc_records: list[_VcRecord] = []
+        self._blackouts: list[tuple[int, bool]] = []
         self._current_time: int = start_time
         self._end_time: int = start_time
         self._closed = False
+        self._sections: list[tuple[list[_VcRecord], int]] = []
 
     def set_timescale(self, ts: int) -> None:
         self.timescale = ts
@@ -100,6 +103,28 @@ class FstWriter:
         if self._scope_stack:
             self._scope_stack.pop()
         self._hier_events.append(bytes([FST_ST_VCD_UPSCOPE]))
+
+    def set_attr_begin(self, attr_type: int, subtype: int,
+                        name: str, arg: int = 0) -> None:
+        buf = bytearray()
+        buf.append(FST_ST_GEN_ATTRBEGIN)
+        buf.append(attr_type)
+        buf.append(subtype)
+        buf.extend(name.encode("utf-8") + b"\x00")
+        buf.extend(write_varint(arg))
+        self._hier_events.append(bytes(buf))
+
+    def set_attr_end(self) -> None:
+        self._hier_events.append(bytes([FST_ST_GEN_ATTREND]))
+
+    def emit_dump_active(self, enable: bool) -> None:
+        self._blackouts.append((self._current_time, enable))
+
+    def flush_context(self) -> None:
+        if self._vc_records:
+            self._sections.append((list(self._vc_records), self._end_time))
+            self._vc_records.clear()
+        self._current_time = self.start_time
 
     def create_var(
         self,
@@ -187,26 +212,28 @@ class FstWriter:
 
     def _build_file(self) -> bytes:
         result = bytearray()
+        # Snapshot any pending section
+        if self._vc_records:
+            self._sections.append((list(self._vc_records), self._end_time))
+        # vc_section_count
+        self._vc_section_count = len(self._sections)
         hdr = self._build_header()
         geom_blk = self._build_geometry_block()
         hier_blk = self._build_hierarchy_block()
         result.extend(self._wrap_block(FST_BL_HDR, hdr))
         result.extend(self._wrap_block(FST_BL_GEOM, geom_blk))
         result.extend(self._wrap_block(FST_BL_HIER, hier_blk))
-        for vc_blk in self._build_vc_sections():
-            result.extend(vc_blk)
+        for section_idx, (records, end_time) in enumerate(self._sections):
+            for vc_blk in self._build_vc_sections(records, end_time, section_idx):
+                result.extend(vc_blk)
+        # Blackout block (after VCDATA sections, per fstapi format)
+        if self._blackouts:
+            result.extend(self._build_blackout_block())
         return bytes(result)
 
     def _build_header(self) -> bytes:
-        # vc_section_count must match the number of VCDATA blocks that will
-        # be written. fst2vcd refuses to open a file (`Could not open ...`)
-        # when this is non-zero but no VCDATA block follows -- the C reader
-        # at fstapi.c:4898 requires `vc_section_count > 0` as part of the
-        # "header looks usable" check, but it also overrides the field after
-        # actually scanning blocks. Writing 1 for an empty file gets us the
-        # worst of both: the override sets it to 0, and the success check
-        # then fails.
-        vc_section_count = 1 if self._vc_records else 0
+        # vc_section_count must match the number of VCDATA blocks written.
+        vc_section_count = max(self._vc_section_count, 1) if (self._vc_records or self._sections) else 0
         buf = bytearray()
         buf.extend(struct.pack(">Q", self.start_time))
         buf.extend(struct.pack(">Q", self._end_time))
@@ -273,11 +300,14 @@ class FstWriter:
         buf.extend(compressed)
         return bytes(buf)
 
-    def _build_vc_sections(self) -> list[bytes]:
-        if not self._vc_records:
+    def _build_vc_sections(self, records=None, end_time=None, section_idx=0) -> list[bytes]:
+        if records is None:
+            records = self._vc_records
+        if not records:
             return []
-        all_records = list(self._vc_records)
+        all_records = list(records)
         times = sorted(set(r.time_delta for r in all_records))
+        section_end = end_time if end_time is not None else self._end_time
         max_handle = self._handle_counter
 
         # frame_data layout per libfst convention (fstapi.c:5208-5350 reader,
@@ -372,9 +402,14 @@ class FstWriter:
             chunk_offsets.append(len(vc_payload))
             signals_present.append(bool(chunk))
             if chunk:
-                # Prepend varint(0) = uncompressed marker
-                vc_payload.append(0)
-                vc_payload.extend(chunk)
+                compressed = zlib.compress(chunk)
+                if len(compressed) < len(chunk):
+                    vc_payload.extend(write_varint(len(chunk)))
+                    vc_payload.extend(compressed)
+                else:
+                    # Uncompressed (compressed larger than raw)
+                    vc_payload.append(0)
+                    vc_payload.extend(chunk)
         chain_cmem = self._build_chain_table(chunk_offsets, signals_present)
 
         # Time table
@@ -398,8 +433,8 @@ class FstWriter:
         # reader's destlen for chunk i = len(handle_chunks[h]).
         mem_required = sum(len(c) for c in handle_chunks.values())
         block_body = bytearray()
-        block_body.extend(struct.pack(">Q", self.start_time))
-        block_body.extend(struct.pack(">Q", self._end_time))
+        block_body.extend(struct.pack(">Q", self.start_time if section_idx == 0 else section_end))
+        block_body.extend(struct.pack(">Q", section_end))
         block_body.extend(struct.pack(">Q", mem_required))
         block_body.extend(write_varint(len(frame_bytes)))
         block_body.extend(write_varint(len(frame_compressed)))
@@ -462,6 +497,19 @@ class FstWriter:
         if zerocnt:
             result.extend(write_varint(zerocnt << 1))
         return bytes(result)
+
+    def _build_blackout_block(self) -> bytes:
+        if not self._blackouts:
+            return b""
+        body = bytearray()
+        body.extend(write_varint(len(self._blackouts)))
+        prev_time = 0
+        for t, active in self._blackouts:
+            delta = t - prev_time
+            prev_time = t
+            body.append(1 if active else 0)
+            body.extend(write_varint(delta))
+        return self._wrap_block(FST_BL_BLACKOUT, bytes(body))
 
     @staticmethod
     def _wrap_block(block_type: int, body: bytes) -> bytes:

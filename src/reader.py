@@ -618,7 +618,8 @@ class FstReader:
             sl = sig_lens[idx]
             initial_vals.append((idx + 1, sect.frame_data[frame_off:frame_off + sl]))
             frame_off += sl
-        yield (sect.beg_time, initial_vals)
+        if sect.beg_time != times[0]:
+            yield (sect.beg_time, initial_vals)
         for ti in range(len(times)):
             changes: list[tuple[int, bytes]] = []
             while tc_head[ti]:

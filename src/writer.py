@@ -112,6 +112,8 @@ class FstWriter:
         alias_handle: int = 0,
         is_string: bool = False,
     ) -> int:
+        if not is_string and length == 0:
+            raise ValueError("reals (length=0, is_string=False) are not yet supported")
         if alias_handle == 0:
             self._handle_counter += 1
             handle = self._handle_counter

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +281,7 @@ class FstBlock:
     offset: int
     block_type: int
     section_length: int
-    payload: bytes
+    payload: Any  # bytes-like view; memoryview for mmap-backed readers
 
 
 @dataclass(frozen=True)

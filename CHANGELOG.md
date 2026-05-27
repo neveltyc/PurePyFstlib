@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.4
+
+Memory efficiency and scalability:
+
+- Optional mmap-backed reading: FstReader(use_mmap=True) avoids loading
+  entire FST files into memory; blocks are lazy _ByteView slices
+- _ByteView class: lightweight non-owning slice over bytes/mmap for
+  zero-copy block payload access
+- Context manager support: FstReader supports `with` statement for
+  deterministic resource cleanup
+- __del__ guard for automatic mmap/file close on GC
+- is_dump_active_at: O(log N) bisect on precomputed blackout arrays
+- FstBlock.payload type relaxed to Any for memoryview compatibility
+- New test: test_reader_mmap_context_manager_and_no_read_bytes_copy
+
 ## 0.2.3
 
 Attribute payload preservation and reporting:

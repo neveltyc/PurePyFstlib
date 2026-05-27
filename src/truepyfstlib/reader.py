@@ -27,6 +27,8 @@ from typing import Callable, Iterator
 import struct
 import zlib
 import base64
+import mmap
+import bisect
 
 from .common import (
     FstBlockType, FstHeader, FstScope, FstVar, FstUpscope,
@@ -79,23 +81,41 @@ class FstReader:
         FstVarType.SV_SHORTREAL,
     }
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, use_mmap: bool = False):
         self.path = Path(path)
-        raw = self.path.read_bytes()
-        # Handle ZWRAPPER (whole-file zlib compression)
-        if raw and raw[0] == FST_BL_ZWRAPPER:
-            if len(raw) < 17:
-                raise FstFormatError("truncated ZWRAPPER")
-            uclen = int.from_bytes(raw[9:17], "big")
-            # Try gzip first, then raw deflate
-            try:
-                self._data = zlib.decompress(raw[17:], 15 + 32)
-            except zlib.error:
-                self._data = zlib.decompress(raw[17:], -15)
-            if len(self._data) != uclen:
-                raise FstFormatError("ZWRAPPER decompressed length mismatch")
+        self._file = None
+        self._mmap = None
+        self._owns_data = False
+
+        # Normal FST files are block based and do not need to be copied into a
+        # giant bytes object.  Use mmap by default so block scanning and lazy
+        # VCDATA reads are backed by the OS page cache.  ZWRAPPER is a
+        # whole-file compressed container, so it necessarily has to be inflated
+        # before normal block parsing can continue.
+        if use_mmap:
+            f = self.path.open("rb")
+            size = self.path.stat().st_size
+            if size == 0:
+                f.close()
+                raise FstFormatError("empty FST file")
+            first = f.read(1)
+            f.seek(0)
+            if first and first[0] == FST_BL_ZWRAPPER:
+                raw = f.read()
+                f.close()
+                self._data = self._inflate_zwrapper(raw)
+                self._owns_data = True
+            else:
+                self._file = f
+                self._mmap = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+                self._data = self._mmap
         else:
-            self._data = raw
+            raw = self.path.read_bytes()
+            if not raw:
+                raise FstFormatError("empty FST file")
+            self._data = self._inflate_zwrapper(raw) if raw[0] == FST_BL_ZWRAPPER else raw
+            self._owns_data = True
+
         self._blocks = self._scan_blocks(self._data)
         self.header = self._parse_header()
         self._signal_lengths: list[int] = []
@@ -115,9 +135,59 @@ class FstReader:
         self._build_handle_map()
         self._parse_vc_sections()
         self._parse_blackouts()
+        self._blackout_times = [t for t, _ in self._blackouts]
+        self._blackout_states = [a for _, a in self._blackouts]
+
 
     @staticmethod
-    def _scan_blocks(data: bytes) -> list[FstBlock]:
+    def _inflate_zwrapper(raw: bytes | bytearray | memoryview) -> bytes:
+        """Inflate a whole-file ZWRAPPER FST container."""
+        if len(raw) < 17:
+            raise FstFormatError("truncated ZWRAPPER")
+        uclen = int.from_bytes(raw[9:17], "big")
+        comp = raw[17:]
+        try:
+            data = zlib.decompress(comp, 15 + 32)
+        except zlib.error:
+            data = zlib.decompress(comp, -15)
+        if len(data) != uclen:
+            raise FstFormatError("ZWRAPPER decompressed length mismatch")
+        return data
+
+    def close(self) -> None:
+        """Release mmap/file resources held by the reader.
+
+        Existing parsed metadata remains usable, but lazy VCDATA iteration
+        requires the underlying mmap/data to stay open.  Prefer using the
+        reader as a context manager for large files.
+        """
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except BufferError:
+                # A caller may still hold a temporary memoryview obtained from a
+                # block payload.  Leave the mmap attached so a later close() can
+                # retry after that view is released.
+                return
+            self._mmap = None
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def __enter__(self) -> "FstReader":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scan_blocks(data: bytes | bytearray | memoryview | mmap.mmap) -> list[FstBlock]:
         """Scan top-level FST blocks.
 
         libfst treats FST_BL_SKIP as an end marker.  Some files contain only a
@@ -125,21 +195,22 @@ class FstReader:
         header once the marker is seen.
         """
         blocks: list[FstBlock] = []
+        view = memoryview(data)
         off = 0
-        n = len(data)
+        n = len(view)
         while off < n:
-            block_type = data[off]
+            block_type = view[off]
             if block_type == FST_BL_SKIP:
                 break
             if off + 9 > n:
                 raise FstFormatError(f"truncated block header at offset {off}")
-            section_length = _u64be(data, off + 1)
+            section_length = _u64be(view, off + 1)
             end = off + 1 + section_length
             if section_length < 8 or end > n:
                 raise FstFormatError(
                     f"invalid section length {section_length} at offset {off}"
                 )
-            payload = data[off + 9:end]
+            payload = _ByteView(data, off + 9, end)
             blocks.append(FstBlock(off, block_type, section_length, payload))
             off = end
         return blocks
@@ -166,10 +237,10 @@ class FstReader:
         max_handle = _u64be(b, off); off += 8
         vc_section_count = _u64be(b, off); off += 8
         timescale = _i8(b[off]); off += 1
-        version = b[off:off + FST_HDR_SIM_VERSION_SIZE]
+        version = bytes(b[off:off + FST_HDR_SIM_VERSION_SIZE])
         version = version.split(b"\0", 1)[0].decode("utf-8", errors="replace")
         off += FST_HDR_SIM_VERSION_SIZE
-        date = b[off:off + FST_HDR_DATE_SIZE]
+        date = bytes(b[off:off + FST_HDR_DATE_SIZE])
         date = date.split(b"\0", 1)[0].decode("utf-8", errors="replace")
         off += FST_HDR_DATE_SIZE
         filetype = b[off] if off < len(b) else 0
@@ -658,13 +729,15 @@ class FstReader:
         return list(self._blackouts)
 
     def is_dump_active_at(self, time: int) -> bool:
-        """Return dump-active state after applying blackout transitions <= time."""
-        active = True
-        for t, state in self._blackouts:
-            if t > time:
-                break
-            active = bool(state)
-        return active
+        """Return dump-active state after applying blackout transitions <= time.
+
+        Uses a precomputed transition array, so per-event blackout checks are
+        O(log N) rather than scanning every transition.
+        """
+        if not self._blackout_times:
+            return True
+        idx = bisect.bisect_right(self._blackout_times, int(time)) - 1
+        return True if idx < 0 else bool(self._blackout_states[idx])
 
     def iter_blackout_intervals(
         self, start: int | None = None, end: int | None = None,
@@ -1165,6 +1238,45 @@ class FstReader:
             "vc_section_count": len(self._vc_sections),
             "signal_lengths": self._signal_lengths,
         }
+
+
+class _ByteView:
+    """Lightweight non-owning slice over bytes/mmap data.
+
+    Unlike ``memoryview(data)[start:end]``, storing this object does not keep an
+    exported buffer alive, so mmap-backed readers can still be closed when no
+    temporary view is in user code.  Slicing returns a temporary memoryview,
+    which zlib/struct/varint code can consume without copying unless the callee
+    explicitly materializes bytes.
+    """
+
+    __slots__ = ("_data", "_start", "_end")
+
+    def __init__(self, data, start: int, end: int):
+        self._data = data
+        self._start = int(start)
+        self._end = int(end)
+
+    def __len__(self) -> int:
+        return self._end - self._start
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(len(self))
+            if step != 1:
+                return bytes(memoryview(self._data)[self._start:self._end][key])
+            return memoryview(self._data)[self._start + start:self._start + stop]
+        if key < 0:
+            key += len(self)
+        if key < 0 or key >= len(self):
+            raise IndexError(key)
+        return self._data[self._start + key]
+
+    def __bytes__(self) -> bytes:
+        return bytes(memoryview(self._data)[self._start:self._end])
+
+    def tobytes(self) -> bytes:
+        return bytes(self)
 
 
 def _u64be(buf: bytes, off: int = 0) -> int:

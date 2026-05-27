@@ -240,6 +240,28 @@ def test_reader_reports_unknown_attr_payload_as_text() -> None:
     assert "vendor" in report and "hex=" in report
     p.unlink(missing_ok=True)
 
+
+def test_reader_mmap_context_manager_and_no_read_bytes_copy() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s")
+    w.emit_time_change(0)
+    w.emit_value_change(h, b"1")
+    w.close()
+
+    with FstReader(str(p), use_mmap=True) as r:
+        assert r.header.max_handle == 1
+        assert list(r.iter_value_changes(h)) == [(0, b"1")]
+        # Normal, non-ZWRAPPER files should be mmap-backed instead of copied
+        # into one giant bytes object.
+        assert getattr(r, "_mmap", None) is not None
+
+    r2 = FstReader(str(p), use_mmap=False)
+    assert list(r2.iter_value_changes(h)) == [(0, b"1")]
+    r2.close()
+    p.unlink(missing_ok=True)
+
 def main() -> None:
     tests = [
         test_reader_derives_geometry_from_hierarchy,
@@ -249,6 +271,7 @@ def main() -> None:
         test_reader_blackout_semantic_filtering,
         test_reader_attaches_sv_vhdl_metadata,
         test_reader_reports_unknown_attr_payload_as_text,
+        test_reader_mmap_context_manager_and_no_read_bytes_copy,
     ]
     for t in tests:
         t()

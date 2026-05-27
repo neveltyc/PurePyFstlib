@@ -316,8 +316,11 @@ class FstSignalMetadata:
     common SystemVerilog/VHDL helper attributes to the variable that follows
     them, matching the way fstWriterCreateVar2(), fstWriterSetValueList(),
     fstWriterEmitEnumTableRef(), and source-stem helpers emit metadata.
-    Unknown or structural attrbegin/attrend records remain available through
-    the raw hierarchy event stream.
+
+    The raw attrbegin/attrend stream is still available via
+    ``FstReader.hierarchy()`` and ``FstReader.attributes()``.  These fields are
+    a structured convenience layer for reader/filter users; they do not imply
+    that a VCD text exporter is enabled.
     """
 
     type_name: str = ""
@@ -329,6 +332,10 @@ class FstSignalMetadata:
     source_instantiation_stem: tuple[str, int] | None = None
     active_attributes: tuple = field(default_factory=tuple)
     misc_attributes: tuple = field(default_factory=tuple)
+    array_attributes: tuple = field(default_factory=tuple)
+    enum_attributes: tuple = field(default_factory=tuple)
+    pack_attributes: tuple = field(default_factory=tuple)
+    all_attributes: tuple = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

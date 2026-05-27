@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2
+
+Attribute introspection and VCD extension output:
+
+- .attributes(decoded=False/True): expose all parsed hierarchy attributes
+- .attributes_for_handle(handle, decoded=): per-signal attribute view
+- .describe_attribute(attr): decoded dict with subtype names, payloads
+- .iter_vcd_extension_lines(): emit $attrbegin/$comment VCD extensions
+- FstSignalMetadata: array_attributes, enum_attributes, pack_attributes,
+  all_attributes sub-lists
+- Enum table values/literals now unescape C-style backslash sequences
+- Enhanced test_reader_attaches_sv_vhdl_metadata with decoded and
+  VCD extension output assertions
+
 ## 0.2.1
 
 Reader enhancements:

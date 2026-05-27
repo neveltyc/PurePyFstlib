@@ -188,6 +188,18 @@ def test_reader_attaches_sv_vhdl_metadata() -> None:
     assert meta.source_stem == ("src/top.sv", 42)
     assert meta.source_instantiation_stem == ("src/inst.sv", 7)
     assert any(a.attr_type == int(FstAttrType.ARRAY) for a in meta.active_attributes)
+    assert len(meta.array_attributes) == 1
+    assert meta.array_attributes[0].subtype == int(FstArrayType.PACKED)
+    assert r.attributes_for_handle(h) == list(meta.all_attributes)
+    decoded = r.attributes_for_handle(h, decoded=True)
+    assert any(d.get("array_kind") == "packed" and d.get("element_count") == 4 for d in decoded)
+    assert any(d.get("type_name") == "std_logic" for d in decoded)
+    attr_lines = list(r.iter_vcd_extension_lines())
+    assert "$comment" in attr_lines
+    assert any(line.startswith("$attrbegin array packed packed 4") for line in attr_lines)
+    assert any("$attrbegin misc 04" in line and "42" in line for line in attr_lines)
+    all_decoded = r.attributes(decoded=True)
+    assert any(d["subtype_name"] == "enumtable" and d.get("enum_table", {}).get("name") == "state_t" for d in all_decoded)
     var = r.handle_to_var[h]
     assert var.supplemental_type_name == "std_logic"
     assert var.supplemental_var_type == 1

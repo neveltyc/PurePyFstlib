@@ -108,6 +108,8 @@ class FstReader:
         self._value_lists: list[str] = []
         self._enum_tables: dict[int, dict] = {}
         self._source_paths: dict[int, str] = {}
+        self._attribute_events: list[FstAttrBegin] = []
+        self._attributes_by_handle: dict[int, tuple[FstAttrBegin, ...]] = {}
         self._parse_geometry_and_hierarchy()
         self._build_handle_map()
         self._parse_vc_sections()
@@ -345,6 +347,7 @@ class FstReader:
                 name = _decode_attr_name(name_raw, attr_type, subtype)
                 attr = FstAttrBegin(attr_type, subtype, name, arg, arg_from_name)
                 events.append(attr)
+                self._attribute_events.append(attr)
                 if attr_type == int(FstAttrType.MISC):
                     add_pending_misc(attr)
                 else:
@@ -366,11 +369,24 @@ class FstReader:
                     handle = alias
                     is_alias = True
                 full = name if not cur_scope else cur_scope + "." + name
+                active_tuple = tuple(active_attrs)
+                misc_tuple = tuple(pending_misc)
                 metadata = _metadata_replace(
                     pending_metadata,
-                    active_attributes=tuple(active_attrs),
-                    misc_attributes=tuple(pending_misc),
+                    active_attributes=active_tuple,
+                    misc_attributes=misc_tuple,
+                    array_attributes=tuple(
+                        a for a in active_tuple if a.attr_type == int(FstAttrType.ARRAY)
+                    ),
+                    enum_attributes=tuple(
+                        a for a in active_tuple if a.attr_type == int(FstAttrType.ENUM)
+                    ),
+                    pack_attributes=tuple(
+                        a for a in active_tuple if a.attr_type == int(FstAttrType.PACK)
+                    ),
+                    all_attributes=active_tuple + misc_tuple,
                 )
+                self._attributes_by_handle[handle] = metadata.all_attributes
                 events.append(FstVar(
                     tag, direction, name, length, handle, is_alias, full,
                     metadata.supplemental_var_type,
@@ -681,6 +697,46 @@ class FstReader:
     @property
     def source_paths(self) -> dict[int, str]:
         return dict(self._source_paths)
+
+    def attributes(self, *, decoded: bool = False) -> list:
+        """Return all parsed FST hierarchy attributes.
+
+        ``decoded=False`` returns the raw ``FstAttrBegin`` records.
+        ``decoded=True`` returns dictionaries with category/subtype names and
+        decoded payloads where applicable.
+        """
+        if not decoded:
+            return list(self._attribute_events)
+        return [self.describe_attribute(a) for a in self._attribute_events]
+
+    def attributes_for_handle(self, handle: int, *, decoded: bool = False) -> list:
+        """Return attributes attached to a handle's hierarchy variable.
+
+        This includes currently active ARRAY/ENUM/PACK attributes plus MISC
+        helper attributes immediately preceding that variable.
+        """
+        attrs = list(self._attributes_by_handle.get(handle, ()))
+        if not decoded:
+            return attrs
+        return [self.describe_attribute(a) for a in attrs]
+
+    def describe_attribute(self, attr: FstAttrBegin) -> dict:
+        """Decode one FST hierarchy attribute into a structured dictionary."""
+        return _describe_attribute(attr, self._source_paths, self._enum_tables)
+
+    def iter_vcd_extension_lines(self) -> Iterator[str]:
+        """Yield libfst-style VCD extension lines for hierarchy attributes.
+
+        This is not a full FST-to-VCD exporter.  It is a lossless textual view
+        of the ATTRBEGIN/ATTREND/comment metadata already present in the FST
+        hierarchy stream, following the formatting used by libfst when
+        ``use_vcd_extensions`` is enabled.
+        """
+        for event in self._hierarchy_events:
+            if isinstance(event, FstAttrBegin):
+                yield from _format_attr_as_vcd_extension(event)
+            elif isinstance(event, FstAttrEnd):
+                yield "$attrend $end"
 
     def metadata_for_handle(self, handle: int) -> FstSignalMetadata | None:
         var = self._handle_to_var.get(handle)
@@ -1108,21 +1164,218 @@ def _parse_varint_from_attr_name(name: str) -> int:
         return 0
 
 
+
+
+_ATTR_TYPE_NAMES = {
+    int(FstAttrType.MISC): "misc",
+    int(FstAttrType.ARRAY): "array",
+    int(FstAttrType.ENUM): "enum",
+    int(FstAttrType.PACK): "pack",
+}
+_MISC_SUBTYPE_NAMES = {
+    int(FstMiscType.COMMENT): "comment",
+    int(FstMiscType.ENVVAR): "envvar",
+    int(FstMiscType.SUPVAR): "supvar",
+    int(FstMiscType.PATHNAME): "pathname",
+    int(FstMiscType.SOURCESTEM): "sourcestem",
+    int(FstMiscType.SOURCEISTEM): "sourceistem",
+    int(FstMiscType.VALUELIST): "valuelist",
+    int(FstMiscType.ENUMTABLE): "enumtable",
+    int(FstMiscType.UNKNOWN): "unknown",
+}
+_ARRAY_SUBTYPE_NAMES = {0: "none", 1: "unpacked", 2: "packed", 3: "sparse"}
+_ENUM_SUBTYPE_NAMES = {
+    0: "sv_integer",
+    1: "sv_bit",
+    2: "sv_logic",
+    3: "sv_int",
+    4: "sv_shortint",
+    5: "sv_longint",
+    6: "sv_byte",
+    7: "sv_unsigned_integer",
+    8: "sv_unsigned_bit",
+    9: "sv_unsigned_logic",
+    10: "sv_unsigned_int",
+    11: "sv_unsigned_shortint",
+    12: "sv_unsigned_longint",
+    13: "sv_unsigned_byte",
+    14: "reg",
+    15: "time",
+}
+_PACK_SUBTYPE_NAMES = {0: "none", 1: "unpacked", 2: "packed", 3: "tagged_packed"}
+
+
+def _attribute_subtype_name(attr_type: int, subtype: int) -> str:
+    if attr_type == int(FstAttrType.MISC):
+        return _MISC_SUBTYPE_NAMES.get(subtype, f"misc_{subtype}")
+    if attr_type == int(FstAttrType.ARRAY):
+        return _ARRAY_SUBTYPE_NAMES.get(subtype, f"array_{subtype}")
+    if attr_type == int(FstAttrType.ENUM):
+        return _ENUM_SUBTYPE_NAMES.get(subtype, f"enum_{subtype}")
+    if attr_type == int(FstAttrType.PACK):
+        return _PACK_SUBTYPE_NAMES.get(subtype, f"pack_{subtype}")
+    return str(subtype)
+
+
+def _fst_unescape(text: str) -> str:
+    """Decode libfst enum-table escape sequences (fstUtilityEscToBin)."""
+    out = bytearray()
+    b = text.encode("latin1", errors="replace")
+    i = 0
+    while i < len(b):
+        ch = b[i]
+        if ch != 0x5C:  # backslash
+            out.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= len(b):
+            out.append(0x5C)
+            break
+        esc = chr(b[i])
+        i += 1
+        mapping = {
+            "a": 7,
+            "b": 8,
+            "f": 12,
+            "n": 10,
+            "r": 13,
+            "t": 9,
+            "v": 11,
+            "'": ord("'"),
+            '"': ord('"'),
+            "\\": ord("\\"),
+            "?": ord("?"),
+        }
+        if esc in mapping:
+            out.append(mapping[esc])
+        elif esc == "x" and i + 1 < len(b):
+            try:
+                out.append(int(bytes(b[i:i+2]).decode("ascii"), 16))
+                i += 2
+            except ValueError:
+                out.append(ord("x"))
+        elif esc in "01234567" and i + 1 < len(b):
+            octal = bytes([ord(esc)]) + b[i:i+2]
+            try:
+                out.append(int(octal.decode("ascii"), 8))
+                i += 2
+            except ValueError:
+                out.append(ord(esc))
+        else:
+            out.append(ord(esc))
+    return out.decode("utf-8", errors="replace")
+
+
+def _describe_attribute(attr: FstAttrBegin, source_paths: dict[int, str], enum_tables: dict[int, dict]) -> dict:
+    attr_type = int(attr.attr_type)
+    subtype = int(attr.subtype)
+    d = {
+        "attr_type": attr_type,
+        "attr_type_name": _ATTR_TYPE_NAMES.get(attr_type, f"attr_{attr_type}"),
+        "subtype": subtype,
+        "subtype_name": _attribute_subtype_name(attr_type, subtype),
+        "name": attr.name,
+        "arg": int(attr.arg),
+        "arg_from_name": int(attr.arg_from_name),
+    }
+    if attr_type == int(FstAttrType.MISC):
+        if subtype == int(FstMiscType.SUPVAR):
+            d["type_name"] = attr.name
+            d["supplemental_var_type"] = int(attr.arg) >> 10
+            d["supplemental_data_type"] = int(attr.arg) & 0x3FF
+        elif subtype in (int(FstMiscType.SOURCESTEM), int(FstMiscType.SOURCEISTEM)):
+            sidx = attr.arg_from_name or _parse_varint_from_attr_name(attr.name)
+            d["source_index"] = int(sidx)
+            d["path"] = source_paths.get(int(sidx), "")
+            d["line"] = int(attr.arg)
+        elif subtype == int(FstMiscType.ENUMTABLE):
+            if attr.name:
+                d["enum_table"] = _parse_enum_table_attr(attr.name)
+            else:
+                d["enum_table_handle"] = int(attr.arg)
+                if int(attr.arg) in enum_tables:
+                    d["enum_table"] = enum_tables[int(attr.arg)]
+        elif subtype == int(FstMiscType.VALUELIST):
+            d["value_list"] = attr.name
+        elif subtype == int(FstMiscType.PATHNAME):
+            d["source_index"] = int(attr.arg)
+            d["path"] = attr.name
+    elif attr_type == int(FstAttrType.ARRAY):
+        d["array_kind"] = d["subtype_name"]
+        d["element_count"] = int(attr.arg)
+    elif attr_type == int(FstAttrType.ENUM):
+        d["enum_value_type"] = d["subtype_name"]
+        d["element_count"] = int(attr.arg)
+    elif attr_type == int(FstAttrType.PACK):
+        d["pack_kind"] = d["subtype_name"]
+        d["member_count"] = int(attr.arg)
+    return d
+
 def _parse_enum_table_attr(text: str) -> dict:
-    # Writer encodes: name count literals... values... .  Preserve raw text too
-    # because third-party writers may use escaping variants.
+    # Writer encodes: name count literals... values... .  This mirrors
+    # fstUtilityExtractEnumTableFromString(): split by spaces, then apply
+    # fstUtilityEscToBin to literal/value tokens.  The raw tokens are retained
+    # because third-party writers may use noncanonical escaping.
     parts = text.split()
     if len(parts) < 2:
-        return {"raw": text, "name": text, "count": 0, "literals": [], "values": []}
+        return {
+            "raw": text,
+            "name": text,
+            "count": 0,
+            "literals": [],
+            "values": [],
+            "raw_literals": [],
+            "raw_values": [],
+        }
     name = parts[0]
     try:
         count = int(parts[1])
     except ValueError:
         count = 0
-    literals = parts[2:2 + count]
-    values = parts[2 + count:2 + 2 * count]
-    return {"raw": text, "name": name, "count": count, "literals": literals, "values": values}
+    raw_literals = parts[2:2 + count]
+    raw_values = parts[2 + count:2 + 2 * count]
+    literals = [_fst_unescape(x) for x in raw_literals]
+    values = [_fst_unescape(x) for x in raw_values]
+    return {
+        "raw": text,
+        "name": name,
+        "count": count,
+        "literals": literals,
+        "values": values,
+        "raw_literals": raw_literals,
+        "raw_values": raw_values,
+    }
 
+
+
+
+def _quote_empty_attr_name(name: str) -> str:
+    return name if name else '""'
+
+
+def _format_attr_as_vcd_extension(attr: FstAttrBegin) -> Iterator[str]:
+    """Format one attribute like libfst's VCD extension printer."""
+    attr_type = int(attr.attr_type)
+    subtype = int(attr.subtype)
+    attr_name = _ATTR_TYPE_NAMES.get(attr_type, "misc")
+    name = _quote_empty_attr_name(attr.name)
+    if attr_type == int(FstAttrType.ARRAY):
+        yield f"$attrbegin {attr_name} {_ARRAY_SUBTYPE_NAMES.get(subtype, 'none')} {name} {int(attr.arg)} $end"
+    elif attr_type == int(FstAttrType.ENUM):
+        yield f"$attrbegin {attr_name} {_ENUM_SUBTYPE_NAMES.get(subtype, 'sv_integer')} {name} {int(attr.arg)} $end"
+    elif attr_type == int(FstAttrType.PACK):
+        yield f"$attrbegin {attr_name} {_PACK_SUBTYPE_NAMES.get(subtype, 'none')} {name} {int(attr.arg)} $end"
+    else:
+        if subtype == int(FstMiscType.COMMENT):
+            yield "$comment"
+            yield f"\t{attr.name}"
+            yield "$end"
+        elif subtype in (int(FstMiscType.SOURCESTEM), int(FstMiscType.SOURCEISTEM)):
+            sidx = attr.arg_from_name or _parse_varint_from_attr_name(attr.name)
+            yield f"$attrbegin misc {subtype:02x} {int(sidx)} {int(attr.arg)} $end"
+        else:
+            yield f"$attrbegin misc {subtype:02x} {name} {int(attr.arg)} $end"
 
 def _metadata_replace(meta: FstSignalMetadata, **kwargs) -> FstSignalMetadata:
     data = {
@@ -1135,6 +1388,10 @@ def _metadata_replace(meta: FstSignalMetadata, **kwargs) -> FstSignalMetadata:
         "source_instantiation_stem": meta.source_instantiation_stem,
         "active_attributes": meta.active_attributes,
         "misc_attributes": meta.misc_attributes,
+        "array_attributes": meta.array_attributes,
+        "enum_attributes": meta.enum_attributes,
+        "pack_attributes": meta.pack_attributes,
+        "all_attributes": meta.all_attributes,
     }
     data.update(kwargs)
     return FstSignalMetadata(**data)

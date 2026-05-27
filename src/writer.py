@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import gzip
+import io
 import struct
 import time as _time
 import zlib
@@ -202,8 +204,15 @@ class FstWriter:
         return bytes(buf)
 
     def _build_hierarchy_block(self) -> bytes:
+        # libfst reads FST_BL_HIER with gzdopen() which expects gzip format
+        # (not raw zlib). zlib.compress() produces zlib format and causes
+        # gzread() to return raw bytes without decompressing, hanging fst2vcd.
+        # Use mtime=0 for byte-deterministic output.
         raw = b"".join(self._hier_events)
-        compressed = zlib.compress(raw)
+        buf_compress = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf_compress, mode="wb", mtime=0) as gz:
+            gz.write(raw)
+        compressed = buf_compress.getvalue()
         buf = bytearray()
         buf.extend(struct.pack(">Q", len(raw)))
         buf.extend(compressed)
@@ -262,10 +271,16 @@ class FstWriter:
                     elif val_byte == 0x31 or val_byte == ord("1"):
                         vli = (cum_tdelta << 2) | (1 << 1)
                     else:
+                        # x/z/h/u/w/l/-/? encoding.  Reader (`iter_value_changes`)
+                        # extracts the index via `(vli >> 1) & 7`, so the layout
+                        # is: bit 0 = 1 (marks non-0/1 value), bits 1..3 = idx
+                        # into FST_RCV_STR, bits 4+ = tdelta.  The previous
+                        # `| (1 << 1)` always forced bit 1 high, so idx 0 (x)
+                        # decoded to idx 1 (z), etc.
                         idx = FST_RCV_STR.find(val_byte)
                         if idx < 0:
                             idx = 7
-                        vli = (cum_tdelta << 4) | (1 << 1) | (idx << 1) | 1
+                        vli = (cum_tdelta << 4) | (idx << 1) | 1
                     chunk.extend(write_varint(vli))
                 else:
                     chunk.extend(write_varint((cum_tdelta << 1) | 1))
@@ -295,10 +310,19 @@ class FstWriter:
 
         # Build block
         indx_len = len(chain_cmem)  # chain table byte length
+        # memory_required_for_traversal: total uncompressed bytes the reader
+        # must allocate via malloc(value + 66) at fstapi.c:5081 to inflate all
+        # per-signal chunks. With value=0 the reader allocates only 66 bytes
+        # and overflows on any non-tiny file (heap corruption -> SIGABRT in
+        # fst2vcd). The C writer accumulates this from each chunk's
+        # uncompressed length (fstapi.c:1485). We currently store every chunk
+        # uncompressed prefixed with a 1-byte varint(0) marker, so the
+        # reader's destlen for chunk i = len(handle_chunks[h]).
+        mem_required = sum(len(c) for c in handle_chunks.values())
         block_body = bytearray()
         block_body.extend(struct.pack(">Q", self.start_time))
         block_body.extend(struct.pack(">Q", self._end_time))
-        block_body.extend(struct.pack(">Q", 0))
+        block_body.extend(struct.pack(">Q", mem_required))
         block_body.extend(write_varint(len(frame_bytes)))
         block_body.extend(write_varint(len(frame_compressed)))
         block_body.extend(write_varint(max_handle))
@@ -323,6 +347,12 @@ class FstWriter:
         
         Offsets are relative to pack_type position (vc_start), NOT VC data start.
         Since VC data starts 1 byte after pack_type, we add 1 to all offsets.
+
+        Important: the chain stream contains ONE varint per signal, no sentinel.
+        libfst's reader computes the trailing sentinel as `indx_pos - vc_start`
+        (fstapi.c:5474). Emitting an explicit sentinel here would make the
+        reader write past chain_table[vc_maxhandle], which is sized
+        calloc(vc_maxhandle+1, ...).
         """
         result = bytearray()
         pval = 0
@@ -334,9 +364,6 @@ class FstWriter:
                 delta = abs_off - pval
                 result.extend(write_varint((delta << 1) | 1))
             pval = abs_off
-        # Sentinel: total VC area length (including everything after pack_type)
-        last_delta = (total_len + 1) - pval
-        result.extend(write_varint((last_delta << 1) | 1))
         return bytes(result)
 
     @staticmethod

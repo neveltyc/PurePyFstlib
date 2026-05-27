@@ -83,22 +83,31 @@ def peek_varint32(buf: bytes | bytearray | memoryview, off: int = 0) -> int:
 
 
 def write_varint(value: int) -> bytes:
-    """Encode an unsigned integer as an FST varint."""
+    """Encode an unsigned integer as an FST varint.
+
+    Matches C `fstCopyVarint64ToRight` exactly: emit LSB-first 7-bit groups,
+    with continuation bit (0x80) set on every byte except the last (which
+    carries the MSB).  Stays roundtrip-consistent with `read_varint`, which
+    advances forward to find the byte without bit 7, then iterates backward
+    to reconstruct the value.
+
+    Previously this function emitted the bytes in reversed order and set the
+    continuation bit on the wrong byte, so any value >= 128 wrote out
+    something that read_varint (and the C reader) decoded to a different
+    integer.  This only manifested once writer tests had VC chunks large
+    enough to push chain deltas above 127.
+    """
     if value < 0:
         raise ValueError("varint must be non-negative")
-    if value == 0:
-        return b"\x00"
-    parts = []
-    while value:
-        parts.append(value & 0x7F)
-        value >>= 7
-    # Set continuation bits, then reverse
-    result = bytearray(len(parts))
-    for i in range(len(parts)):
-        b = parts[i]
-        if i > 0:
-            b |= 0x80
-        result[len(parts) - 1 - i] = b
+    result = bytearray()
+    while True:
+        nxt = value >> 7
+        if nxt:
+            result.append((value & 0x7F) | 0x80)
+            value = nxt
+        else:
+            result.append(value & 0x7F)
+            break
     return bytes(result)
 
 

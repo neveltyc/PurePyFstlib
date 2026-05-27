@@ -82,6 +82,7 @@ class FstWriter:
         self._current_time: int = start_time
         self._section_begin_time: int = start_time
         self._section_initial_values: dict[int, bytes] = {}
+        self._hierarchy_frozen: bool = False
         self._end_time: int = start_time
         self._closed = False
         self._sections: list[_VcSection] = []
@@ -99,7 +100,23 @@ class FstWriter:
     def set_file_type(self, ft: int) -> None:
         self.filetype = ft
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("FstWriter is already closed")
+
+    def _check_hierarchy_open(self) -> None:
+        self._ensure_open()
+        if self._hierarchy_frozen:
+            raise RuntimeError(
+                "hierarchy is frozen: cannot declare variables/scopes "
+                "after writing value changes"
+            )
+
+    def _freeze_hierarchy(self) -> None:
+        self._hierarchy_frozen = True
+
     def set_scope(self, scope_type: int, name: str, component: str = "") -> None:
+        self._check_hierarchy_open()
         component = component or name
         self._scope_stack.append((name, component))
         self._scope_count += 1
@@ -111,12 +128,14 @@ class FstWriter:
         self._hier_events.append(bytes(buf))
 
     def set_upscope(self) -> None:
+        self._check_hierarchy_open()
         if self._scope_stack:
             self._scope_stack.pop()
         self._hier_events.append(bytes([FST_ST_VCD_UPSCOPE]))
 
     def set_attr_begin(self, attr_type: int, subtype: int,
                         name: str, arg: int = 0) -> None:
+        self._check_hierarchy_open()
         if not isinstance(attr_type, int) or attr_type < 0:
             raise ValueError(f"attr_type must be non-negative int, got {attr_type!r}")
         if not isinstance(subtype, int) or subtype < 0:
@@ -130,12 +149,15 @@ class FstWriter:
         self._hier_events.append(bytes(buf))
 
     def set_attr_end(self) -> None:
+        self._check_hierarchy_open()
         self._hier_events.append(bytes([FST_ST_GEN_ATTREND]))
 
     def emit_dump_active(self, enable: bool) -> None:
+        self._freeze_hierarchy()
         self._blackouts.append((self._current_time, enable))
 
     def flush_context(self) -> None:
+        self._freeze_hierarchy()
         if not self._vc_records:
             return
         # frame_snapshot captures the section"s BEGINNING state
@@ -161,6 +183,7 @@ class FstWriter:
         alias_handle: int = 0,
         is_string: bool = False,
     ) -> int:
+        self._check_hierarchy_open()
         REAL_TYPES = {
             FstVarType.VCD_REAL, FstVarType.VCD_REAL_PARAMETER,
             FstVarType.VCD_REALTIME, FstVarType.SV_SHORTREAL,
@@ -196,10 +219,25 @@ class FstWriter:
         else:
             if alias_handle not in self._handle_info:
                 raise KeyError(f"unknown alias handle: {alias_handle}")
+            base = self._handle_info[alias_handle]
+            if var_type != base.var_type:
+                raise ValueError(
+                    f"alias var_type ({var_type}) must match canonical ({base.var_type})"
+                )
+            if length != base.length:
+                raise ValueError(
+                    f"alias length ({length}) must match canonical ({base.length})"
+                )
+            if is_string != base.is_string:
+                raise ValueError(
+                    f"alias is_string ({is_string}) must match canonical ({base.is_string})"
+                )
             handle = alias_handle
+            # Use canonical metadata, only name differs
             alias_info = _VarInfo(
-                var_type=var_type, direction=direction, name=name,
-                length=length, alias_handle=alias_handle, is_string=is_string,
+                var_type=base.var_type, direction=direction, name=name,
+                length=base.length, alias_handle=alias_handle,
+                is_string=base.is_string,
             )
             self._vars_by_handle.setdefault(handle, []).append(alias_info)
         buf = bytearray()
@@ -212,6 +250,7 @@ class FstWriter:
         return handle
 
     def emit_time_change(self, time: int) -> None:
+        self._freeze_hierarchy()
         if time < self._current_time:
             raise ValueError("time must be monotonically increasing")
         self._current_time = time
@@ -236,6 +275,7 @@ class FstWriter:
         return info
 
     def emit_value_change(self, handle: int, value: bytes) -> None:
+        self._ensure_open()
         if isinstance(value, str):
             value = value.encode("utf-8")
         info = self._validate_handle(handle, value)
@@ -247,11 +287,13 @@ class FstWriter:
         self._current_values[handle] = value
 
     def emit_value_change_bit(self, handle: int, bit: int) -> None:
+        self._ensure_open()
         if bit not in (0, 1):
             raise ValueError("bit must be 0 or 1")
         self.emit_value_change(handle, b"1" if bit else b"0")
 
     def close(self) -> None:
+        self._ensure_open()
         if self._closed:
             return
         self._closed = True

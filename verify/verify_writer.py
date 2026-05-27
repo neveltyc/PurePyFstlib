@@ -119,7 +119,7 @@ def test_alias_does_not_overwrite_canonical():
     w = FstWriter(path, timescale=-9)
     w.set_scope(FstScopeType.VCD_MODULE, "top")
     h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "a")
-    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "a_alias", alias_handle=h)
+    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "a_alias", alias_handle=h)
     w.set_upscope()
     w.emit_time_change(0)
     w.emit_value_change(h, b"10101010")
@@ -308,6 +308,172 @@ def test_emit_value_change_accepts_str():
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == [(0, b"hello")]
     Path(path).unlink()
+def test_empty_file_accepted_by_fst2vcd():
+    """Empty file with variables must pass fst2vcd acceptance."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s")
+    w.set_upscope()
+    w.close()
+    vcd = _fst2vcd_ok(path)
+    assert "$var" in vcd
+    Path(path).unlink()
+
+
+def test_xz_values_roundtrip():
+    """All x/z/h/u/w/l/-/? values roundtrip correctly."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "sig")
+    w.set_upscope()
+    expected = []
+    t = 0
+    for ch in b"xzhuwl-?":
+        w.emit_time_change(t)
+        w.emit_value_change(h, bytes([ch]))
+        expected.append((t, bytes([ch])))
+        t += 5
+    w.close()
+    r = FstReader(path)
+    assert list(r.iter_value_changes(h)) == expected
+    Path(path).unlink()
+
+
+def test_nbit_vector_boundaries():
+    """Multi-bit vectors of various widths roundtrip correctly."""
+    for width in [2, 8, 33, 64]:
+        with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+            path = f.name
+        w = FstWriter(path, timescale=-9)
+        w.set_scope(FstScopeType.VCD_MODULE, "top")
+        h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, width, "vec")
+        w.set_upscope()
+        val_a = b"0" * width
+        val_b = b"1" * width
+        if width == 33:
+            val_b = b"1" * 33
+        w.emit_time_change(0)
+        w.emit_value_change(h, val_a)
+        w.emit_time_change(10)
+        w.emit_value_change(h, val_b)
+        w.emit_time_change(20)
+        w.emit_value_change(h, val_a)
+        w.close()
+        r = FstReader(path)
+        changes = list(r.iter_value_changes(h))
+        assert changes == [(0, val_a), (10, val_b), (20, val_a)], f"width={width}: {changes}"
+        _fst2vcd_ok(path)
+        Path(path).unlink()
+
+
+def test_xz_in_multibit():
+    """Multi-bit vectors with x/z values roundtrip."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "bus")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change(h, b"xxxxxxxx")
+    w.emit_time_change(10)
+    w.emit_value_change(h, b"zzzzzzzz")
+    w.close()
+    r = FstReader(path)
+    assert list(r.iter_value_changes(h)) == [(0, b"xxxxxxxx"), (10, b"zzzzzzzz")]
+    _fst2vcd_ok(path)
+    Path(path).unlink()
+
+
+def test_multisection_nbit_string_mixed():
+    """Multi-section with N-bit vector + string inheriting across sections."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h1 = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "data")
+    h2 = w.create_var(FstVarType.GEN_STRING, FstVarDir.IMPLICIT, 0, "log")
+    w.set_upscope()
+    # Section 1
+    w.emit_time_change(10)
+    w.emit_value_change(h1, b"10101010")
+    w.emit_value_change(h2, b"start")
+    w.flush_context()
+    # Section 2: inherits data=b"10101010", log=b"start"
+    w.emit_time_change(20)
+    w.emit_value_change(h1, b"11110000")
+    w.emit_time_change(30)
+    w.emit_value_change(h2, b"end")
+    w.close()
+    r = FstReader(path)
+    assert len(r.vc_sections) == 2
+    assert r.get_initial_value(h1, 0) == b"00000000"  # sec1 initial
+    assert r.get_initial_value(h1, 1) == b"10101010"  # sec2 initial inherited
+    assert list(r.iter_value_changes(h2, 0)) == [(10, b"start")]
+    assert list(r.iter_value_changes(h2, 1)) == [(30, b"end")]
+    _fst2vcd_ok(path)
+    Path(path).unlink()
+
+
+def test_hierarchy_frozen_after_first_emit():
+    """create_var must raise after emit_time_change is called."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "a")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change(1, b"1")
+    try:
+        w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "b")
+        assert False, "should have raised"
+    except RuntimeError:
+        pass
+    Path(path).unlink()
+
+
+def test_alias_mismatch_rejected():
+    """Alias with mismatched type/length must raise ValueError."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 4, "data")
+    w.set_upscope()
+    try:
+        w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 4, "data2", alias_handle=h)
+        assert False, "should have raised for type mismatch"
+    except ValueError:
+        pass
+    try:
+        w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "data2", alias_handle=h)
+        assert False, "should have raised for length mismatch"
+    except ValueError:
+        pass
+    Path(path).unlink()
+
+
+def test_close_then_mutate_rejected():
+    """emit_value_change after close must raise RuntimeError."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "a")
+    w.set_upscope()
+    w.close()
+    try:
+        w.emit_value_change(h, b"1")
+        assert False, "should have raised"
+    except RuntimeError:
+        pass
+    Path(path).unlink()
+
 
 
 def main():
@@ -325,6 +491,14 @@ def main():
         test_blackout_reader_exposes_intervals,
         test_zero_length_non_string_rejected,
         test_emit_value_change_accepts_str,
+        test_empty_file_accepted_by_fst2vcd,
+        test_xz_values_roundtrip,
+        test_nbit_vector_boundaries,
+        test_xz_in_multibit,
+        test_multisection_nbit_string_mixed,
+        test_hierarchy_frozen_after_first_emit,
+        test_alias_mismatch_rejected,
+        test_close_then_mutate_rejected,
     ]
     for t in tests:
         t()

@@ -10,11 +10,13 @@ Implemented:
   Signal types: 1-bit, N-bit (packed binary or ASCII), string (varlen).
 
 Not implemented:
-  Blackout semantic filtering in event iterators (raw intervals
-  are available via .blackouts).
-  Full SystemVerilog supplemental hierarchy metadata (enum tables,
-  source stems, packed/unpacked array subtypes).
   Parallel .hier file support.
+
+Notes:
+  Blackout sections are decoded and can be applied by event iterators with
+  respect_blackout=True.  SystemVerilog/VHDL helper metadata is decoded from
+  hierarchy attributes and attached to variables where libfst writer emits
+  it as pre-variable attributes.
 """
 
 from __future__ import annotations
@@ -27,14 +29,14 @@ import zlib
 
 from .common import (
     FstBlockType, FstHeader, FstScope, FstVar, FstUpscope,
-    FstAttrBegin, FstAttrEnd, FstFormatError, FstBlock,
+    FstAttrBegin, FstAttrEnd, FstFormatError, FstBlock, FstSignalMetadata,
     FST_BL_HDR, FST_BL_VCDATA, FST_BL_BLACKOUT, FST_BL_GEOM,
     FST_BL_HIER, FST_BL_VCDATA_DYN_ALIAS, FST_BL_HIER_LZ4,
     FST_BL_HIER_LZ4DUO, FST_BL_VCDATA_DYN_ALIAS2, FST_BL_ZWRAPPER, FST_BL_SKIP,
     FST_ST_GEN_ATTRBEGIN, FST_ST_GEN_ATTREND,
     FST_ST_VCD_SCOPE, FST_ST_VCD_UPSCOPE, FST_VT_MAX,
     FST_HDR_SIM_VERSION_SIZE, FST_HDR_DATE_SIZE, FST_DOUBLE_ENDTEST,
-    FST_RCV_STR, FstVarType,
+    FST_RCV_STR, FstVarType, FstAttrType, FstMiscType,
 )
 from .varint import (
     read_varint, read_varint32, read_varint64,
@@ -101,6 +103,11 @@ class FstReader:
         self._vc_sections: list[VcSection] = []
         self._handle_to_var: dict[int, 'FstVar'] = {}
         self._vars_by_handle: dict[int, list['FstVar']] = {}
+        self._comments: list[str] = []
+        self._env_vars: list[str] = []
+        self._value_lists: list[str] = []
+        self._enum_tables: dict[int, dict] = {}
+        self._source_paths: dict[int, str] = {}
         self._parse_geometry_and_hierarchy()
         self._build_handle_map()
         self._parse_vc_sections()
@@ -239,12 +246,69 @@ class FstReader:
         return data
 
     def _parse_hierarchy(self, data: bytes) -> list:
+        """Parse hierarchy stream and attach common libfst metadata.
+
+        libfst exposes ATTRBEGIN/ATTREND as hierarchy events.  Writer helper
+        APIs such as fstWriterCreateVar2(), fstWriterSetValueList(),
+        fstWriterEmitEnumTableRef(), and source-stem helpers emit MISC
+        attributes immediately before the variable to which they apply.  This
+        parser preserves the raw hierarchy events and also attaches those
+        helper attributes to the next FstVar as FstSignalMetadata.
+        """
         events: list = []
         scopes: list[str] = []
         cur_scope = ""
         current_handle = 0
         off = 0
         n = len(data)
+        active_attrs: list[FstAttrBegin] = []
+        pending_misc: list[FstAttrBegin] = []
+        pending_metadata = FstSignalMetadata()
+
+        def add_pending_misc(attr: FstAttrBegin) -> None:
+            nonlocal pending_metadata
+            if attr.attr_type != int(FstAttrType.MISC):
+                return
+            subtype = int(attr.subtype)
+            if subtype == int(FstMiscType.COMMENT):
+                self._comments.append(attr.name)
+            elif subtype == int(FstMiscType.ENVVAR):
+                self._env_vars.append(attr.name)
+            elif subtype == int(FstMiscType.PATHNAME):
+                self._source_paths[int(attr.arg)] = attr.name
+            elif subtype == int(FstMiscType.VALUELIST):
+                self._value_lists.append(attr.name)
+                pending_misc.append(attr)
+                pending_metadata = _metadata_replace(pending_metadata, value_list=attr.name)
+            elif subtype == int(FstMiscType.SUPVAR):
+                pending_misc.append(attr)
+                svt = int(attr.arg) >> 10
+                sdt = int(attr.arg) & 0x3FF
+                pending_metadata = _metadata_replace(
+                    pending_metadata,
+                    type_name=attr.name,
+                    supplemental_var_type=svt,
+                    supplemental_data_type=sdt,
+                )
+            elif subtype == int(FstMiscType.ENUMTABLE):
+                if attr.name:
+                    self._enum_tables[int(attr.arg)] = _parse_enum_table_attr(attr.name)
+                else:
+                    pending_misc.append(attr)
+                    pending_metadata = _metadata_replace(
+                        pending_metadata, enum_table_handle=int(attr.arg)
+                    )
+            elif subtype in (int(FstMiscType.SOURCESTEM), int(FstMiscType.SOURCEISTEM)):
+                pending_misc.append(attr)
+                sidx = attr.arg_from_name or _parse_varint_from_attr_name(attr.name)
+                stem = (self._source_paths.get(sidx, ""), int(attr.arg))
+                if subtype == int(FstMiscType.SOURCESTEM):
+                    pending_metadata = _metadata_replace(pending_metadata, source_stem=stem)
+                else:
+                    pending_metadata = _metadata_replace(
+                        pending_metadata, source_instantiation_stem=stem
+                    )
+
         while off < n:
             tag = data[off]
             off += 1
@@ -265,12 +329,30 @@ class FstReader:
                 else:
                     cur_scope = ""
             elif tag == FST_ST_GEN_ATTRBEGIN:
+                if off + 2 > n:
+                    raise FstFormatError("truncated attrbegin")
                 attr_type = data[off]; subtype = data[off + 1]; off += 2
-                name, off = _read_cstr(data, off)
+                name_raw, off = _read_cstr_raw(data, off)
                 arg, used = read_varint(data, off); off += used
-                events.append(FstAttrBegin(attr_type, subtype, name, arg))
+                arg_from_name = 0
+                if attr_type == int(FstAttrType.MISC) and subtype in (
+                    int(FstMiscType.SOURCESTEM), int(FstMiscType.SOURCEISTEM)
+                ):
+                    try:
+                        arg_from_name, _ = read_varint(name_raw, 0)
+                    except Exception:
+                        arg_from_name = 0
+                name = _decode_attr_name(name_raw, attr_type, subtype)
+                attr = FstAttrBegin(attr_type, subtype, name, arg, arg_from_name)
+                events.append(attr)
+                if attr_type == int(FstAttrType.MISC):
+                    add_pending_misc(attr)
+                else:
+                    active_attrs.append(attr)
             elif tag == FST_ST_GEN_ATTREND:
                 events.append(FstAttrEnd())
+                if active_attrs:
+                    active_attrs.pop()
             elif 0 <= tag <= FST_VT_MAX:
                 direction = data[off]; off += 1
                 name, off = _read_cstr(data, off)
@@ -284,7 +366,20 @@ class FstReader:
                     handle = alias
                     is_alias = True
                 full = name if not cur_scope else cur_scope + "." + name
-                events.append(FstVar(tag, direction, name, length, handle, is_alias, full))
+                metadata = _metadata_replace(
+                    pending_metadata,
+                    active_attributes=tuple(active_attrs),
+                    misc_attributes=tuple(pending_misc),
+                )
+                events.append(FstVar(
+                    tag, direction, name, length, handle, is_alias, full,
+                    metadata.supplemental_var_type,
+                    metadata.supplemental_data_type,
+                    metadata.type_name,
+                    metadata,
+                ))
+                pending_misc = []
+                pending_metadata = FstSignalMetadata()
             elif tag == 0xFF and off == n:
                 break
             else:
@@ -532,12 +627,64 @@ class FstReader:
 
     @property
     def blackouts(self) -> list[tuple[int, bool]]:
-        """Blackout intervals (time, is_active).
-        
-        Each entry records a dump-active state change at the given time.
-        Use this to filter value changes during inactive periods.
+        """Blackout transitions as ``(time, is_dump_active)``.
+
+        This mirrors libfst's ``blackout_times`` / ``blackout_activity``
+        arrays.  Event iterators keep raw VCDATA behavior by default; pass
+        ``respect_blackout=True`` to suppress events while dump is inactive.
         """
         return list(self._blackouts)
+
+    def is_dump_active_at(self, time: int) -> bool:
+        """Return dump-active state after applying blackout transitions <= time."""
+        active = True
+        for t, state in self._blackouts:
+            if t > time:
+                break
+            active = bool(state)
+        return active
+
+    def iter_blackout_intervals(
+        self, start: int | None = None, end: int | None = None,
+    ) -> Iterator[tuple[int, int | None, bool]]:
+        """Yield dump-active intervals as ``(begin, end, active)``.
+
+        ``end`` is exclusive and may be ``None`` for the final open interval.
+        ``start``/``end`` trim the yielded intervals but do not mutate the
+        underlying blackout transitions.
+        """
+        lo = self.header.start_time if start is None else int(start)
+        hi = self.header.end_time if end is None else int(end)
+        points = [(lo, self.is_dump_active_at(lo))]
+        points.extend((t, a) for t, a in self._blackouts if lo < t < hi)
+        for i, (t, active) in enumerate(points):
+            nt = points[i + 1][0] if i + 1 < len(points) else hi
+            if nt > t:
+                yield (t, nt, active)
+
+    @property
+    def comments(self) -> list[str]:
+        return list(self._comments)
+
+    @property
+    def env_vars(self) -> list[str]:
+        return list(self._env_vars)
+
+    @property
+    def value_lists(self) -> list[str]:
+        return list(self._value_lists)
+
+    @property
+    def enum_tables(self) -> dict[int, dict]:
+        return dict(self._enum_tables)
+
+    @property
+    def source_paths(self) -> dict[int, str]:
+        return dict(self._source_paths)
+
+    def metadata_for_handle(self, handle: int) -> FstSignalMetadata | None:
+        var = self._handle_to_var.get(handle)
+        return var.metadata if var is not None else None
 
     @property
     def num_handles(self) -> int:
@@ -590,7 +737,7 @@ class FstReader:
             yield t, self.decode_value(handle, v)
 
     def iter_value_changes_all(
-        self, handle: int, *, include_initial: bool = False,
+        self, handle: int, *, include_initial: bool = False, respect_blackout: bool = False,
     ) -> Iterator[tuple[int, bytes]]:
         """Iterate a handle's value changes across all VCDATA sections.
 
@@ -599,14 +746,14 @@ class FstReader:
         where a time-window boundary needs a correct starting snapshot.
         """
         for section_index, sect in enumerate(self._vc_sections):
-            if include_initial:
+            if include_initial and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield sect.beg_time, self.get_initial_value(handle, section_index)
-            yield from self.iter_value_changes(handle, section_index)
+            yield from self.iter_value_changes(handle, section_index, respect_blackout=respect_blackout)
 
     def iter_decoded_value_changes_all(
-        self, handle: int, *, include_initial: bool = False,
+        self, handle: int, *, include_initial: bool = False, respect_blackout: bool = False,
     ) -> Iterator[tuple[int, object]]:
-        for t, v in self.iter_value_changes_all(handle, include_initial=include_initial):
+        for t, v in self.iter_value_changes_all(handle, include_initial=include_initial, respect_blackout=respect_blackout):
             yield t, self.decode_value(handle, v)
 
     def vars(self) -> list[FstVar]:
@@ -643,7 +790,7 @@ class FstReader:
         return sect.frame_data[off:off + sig_len]
 
     def iter_value_changes(
-        self, handle: int, section_index: int = 0,
+        self, handle: int, section_index: int = 0, *, respect_blackout: bool = False,
     ) -> Iterator[tuple[int, bytes]]:
         if section_index >= len(self._vc_sections):
             return
@@ -652,7 +799,8 @@ class FstReader:
 
         if idx >= len(sect.chain_table) or idx >= len(sect.chain_table_lengths):
             initial = self.get_initial_value(handle, section_index)
-            yield (sect.beg_time, initial)
+            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+                yield (sect.beg_time, initial)
             return
 
         chain_off = sect.chain_table[idx]
@@ -660,13 +808,15 @@ class FstReader:
 
         # Negative chain_len: dynamic alias, return only the initial value
         if chain_len < 0:
-            yield (sect.beg_time, self.get_initial_value(handle, section_index))
+            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+                yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
 
         if chain_off <= 0 or chain_len <= 0:
             if idx < len(self._signal_lengths) and not self._signal_lengths[idx]:
                 return  # string with no data: emit nothing (C reader behavior)
-            yield (sect.beg_time, self.get_initial_value(handle, section_index))
+            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+                yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
         payload = self._data
         vc_data_start = sect.block_offset + 9 + sect.vc_start
@@ -701,7 +851,8 @@ class FstReader:
                 off += length
                 if tidx >= len(times):
                     break
-                yield (times[tidx], val)
+                if not respect_blackout or self.is_dump_active_at(times[tidx]):
+                    yield (times[tidx], val)
                 continue
             if sig_len <= 1:
                 # Single-bit: value encoded in vli
@@ -731,10 +882,11 @@ class FstReader:
                     off += sig_len
             if tidx >= len(times):
                 break
-            yield (times[tidx], val)
+            if not respect_blackout or self.is_dump_active_at(times[tidx]):
+                yield (times[tidx], val)
 
     def iter_time_value_pairs(
-        self, section_index: int = 0,
+        self, section_index: int = 0, *, respect_blackout: bool = False,
     ) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
         """Yield time-ordered changes for one VCDATA section.
 
@@ -762,7 +914,7 @@ class FstReader:
             frame_off += sl
 
         if not times:
-            if initial_vals:
+            if initial_vals and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield (sect.beg_time, initial_vals)
             return
 
@@ -809,7 +961,7 @@ class FstReader:
                 scatterptr[idx] = tc_head[tdelta]
                 tc_head[tdelta] = idx + 1
 
-        if sect.beg_time != times[0]:
+        if sect.beg_time != times[0] and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
             yield (sect.beg_time, initial_vals)
         for ti in range(len(times)):
             changes: list[tuple[int, bytes]] = []
@@ -889,13 +1041,13 @@ class FstReader:
                             scatterptr[idx] = tc_head[next_ti]
                             tc_head[next_ti] = idx + 1
                 changes.append((idx + 1, val))
-            if changes:
+            if changes and (not respect_blackout or self.is_dump_active_at(times[ti])):
                 yield (times[ti], changes)
 
-    def iter_time_value_pairs_all(self) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
+    def iter_time_value_pairs_all(self, *, respect_blackout: bool = False) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
         """Yield time/value batches from all VCDATA sections in file order."""
         for idx in range(len(self._vc_sections)):
-            yield from self.iter_time_value_pairs(idx)
+            yield from self.iter_time_value_pairs(idx, respect_blackout=respect_blackout)
 
     def summary(self) -> dict:
         return {
@@ -925,4 +1077,65 @@ def _read_cstr(buf: bytes | bytearray | memoryview, off: int) -> tuple[str, int]
     if end >= n:
         raise FstFormatError("unterminated C string")
     return bytes(buf[off:end]).decode("utf-8", errors="replace"), end + 1
+
+def _read_cstr_raw(buf: bytes | bytearray | memoryview, off: int) -> tuple[bytes, int]:
+    end = off
+    n = len(buf)
+    while end < n and buf[end] != 0:
+        end += 1
+    if end >= n:
+        raise FstFormatError("unterminated C string")
+    return bytes(buf[off:end]), end + 1
+
+
+def _decode_attr_name(raw: bytes, attr_type: int, subtype: int) -> str:
+    # SOURCESTEM/SOURCEISTEM overload the name field with varint bytes.  Keep
+    # those bytes reversible via latin-1; normal textual attributes are UTF-8.
+    if attr_type == int(FstAttrType.MISC) and subtype in (
+        int(FstMiscType.SOURCESTEM), int(FstMiscType.SOURCEISTEM)
+    ):
+        return raw.decode("latin1", errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _parse_varint_from_attr_name(name: str) -> int:
+    if not name:
+        return 0
+    try:
+        val, _ = read_varint(name.encode("latin1"), 0)
+        return int(val)
+    except Exception:
+        return 0
+
+
+def _parse_enum_table_attr(text: str) -> dict:
+    # Writer encodes: name count literals... values... .  Preserve raw text too
+    # because third-party writers may use escaping variants.
+    parts = text.split()
+    if len(parts) < 2:
+        return {"raw": text, "name": text, "count": 0, "literals": [], "values": []}
+    name = parts[0]
+    try:
+        count = int(parts[1])
+    except ValueError:
+        count = 0
+    literals = parts[2:2 + count]
+    values = parts[2 + count:2 + 2 * count]
+    return {"raw": text, "name": name, "count": count, "literals": literals, "values": values}
+
+
+def _metadata_replace(meta: FstSignalMetadata, **kwargs) -> FstSignalMetadata:
+    data = {
+        "type_name": meta.type_name,
+        "supplemental_var_type": meta.supplemental_var_type,
+        "supplemental_data_type": meta.supplemental_data_type,
+        "value_list": meta.value_list,
+        "enum_table_handle": meta.enum_table_handle,
+        "source_stem": meta.source_stem,
+        "source_instantiation_stem": meta.source_instantiation_stem,
+        "active_attributes": meta.active_attributes,
+        "misc_attributes": meta.misc_attributes,
+    }
+    data.update(kwargs)
+    return FstSignalMetadata(**data)
 

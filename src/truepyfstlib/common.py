@@ -309,6 +309,29 @@ class FstScope:
 
 
 @dataclass(frozen=True)
+class FstSignalMetadata:
+    """Semantic metadata decoded from FST hierarchy attributes.
+
+    libfst exposes attributes as hierarchy events.  This structure attaches
+    common SystemVerilog/VHDL helper attributes to the variable that follows
+    them, matching the way fstWriterCreateVar2(), fstWriterSetValueList(),
+    fstWriterEmitEnumTableRef(), and source-stem helpers emit metadata.
+    Unknown or structural attrbegin/attrend records remain available through
+    the raw hierarchy event stream.
+    """
+
+    type_name: str = ""
+    supplemental_var_type: int = 0
+    supplemental_data_type: int = 0
+    value_list: str = ""
+    enum_table_handle: int = 0
+    source_stem: tuple[str, int] | None = None
+    source_instantiation_stem: tuple[str, int] | None = None
+    active_attributes: tuple = field(default_factory=tuple)
+    misc_attributes: tuple = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class FstVar:
     var_type: int
     direction: int
@@ -319,6 +342,8 @@ class FstVar:
     full_name: str
     supplemental_var_type: int = 0
     supplemental_data_type: int = 0
+    supplemental_type_name: str = ""
+    metadata: FstSignalMetadata = field(default_factory=FstSignalMetadata)
 
 
 @dataclass(frozen=True)
@@ -332,6 +357,7 @@ class FstAttrBegin:
     subtype: int
     name: str
     arg: int
+    arg_from_name: int = 0
 
 
 @dataclass(frozen=True)

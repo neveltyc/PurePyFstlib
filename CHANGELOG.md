@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1
+
+Reader enhancements:
+
+- SV/VHDL metadata from hierarchy: FstSignalMetadata attached to FstVar
+  decodes SUPVAR, VALUELIST, ENUMTABLE, SOURCESTEM, SOURCEISTEM,
+  COMMENT, ENVVAR, PATHNAME, and ARRAY attributes from attrbegin events
+- New properties: .comments, .env_vars, .value_lists, .enum_tables,
+  .source_paths, .metadata_for_handle(handle)
+- Blackout semantic filtering: iter_value_changes and
+  iter_time_value_pairs support respect_blackout=True to suppress
+  events during dump-inactive periods
+- Blackout helpers: .is_dump_active_at(time), .iter_blackout_intervals
+  yielding (begin, end, active) intervals
+- FstVar extended with supplemental_type_name and metadata fields
+- FstAttrBegin extended with arg_from_name for SOURCESTEM varint names
+- New verify/verify_reader.py tests: blackout filtering, SV/VHDL metadata
+
 ## 0.2.0
 
 Reader enhancements:

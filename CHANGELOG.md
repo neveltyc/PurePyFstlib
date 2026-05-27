@@ -1,6 +1,35 @@
 # Changelog
 
+## 0.3.0
+
+Signal index, time-window queries, and random-access APIs:
+
+- _build_signal_index: full_name/short_name/handle name maps for O(1) lookup
+- _build_section_time_index: section begin/end time arrays
+- signal_names(): list all signal names (canonical or with aliases)
+- names_for_handle(handle): all hierarchy names for a handle
+- resolve_signal(name): resolve name to handle (full name, short name, or alias)
+- find_signals(pattern): fnmatch glob search for signal names
+- find_handle_by_name(name): exact name lookup
+- get_value_at_time(handle, time): value at a specific time point
+  using bisect over section time ranges
+- section_for_time(time): find VCDATA section index for a time
+- section_range_for_times(begin, end): section range for time window
+- iter_time_window(begin, end): filtered time-window value iteration
+  with optional signal name filter and blackout respect
+- heapq-based time-ordered stream merging for multi-handle iterations
+
 ## 0.2.4
+
+Memory efficiency and scalability:
+
+- mmap-backed reading (default True): FstReader avoids loading entire
+  FST files into memory
+- _ByteView: non-owning lazy slice for zero-copy block payload access
+- Context manager: `with FstReader(path) as r:` + close()
+- is_dump_active_at: O(log N) via bisect on precomputed arrays
+
+
 
 Memory efficiency and scalability:
 

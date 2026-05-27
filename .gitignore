@@ -28,3 +28,4 @@ add_chain.py
 _*.py
 counter.fst
 transaction.fst
+_test.vcd

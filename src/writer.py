@@ -66,6 +66,7 @@ class FstWriter:
         self._handle_counter = 0
         self._vars: dict[int, _VarInfo] = {}
         self._scope_stack: list[tuple[str, str]] = []
+        self._scope_count = 0
         self._hier_events: list[bytes] = []
         self._vc_records: list[_VcRecord] = []
         self._current_time: int = start_time
@@ -87,6 +88,7 @@ class FstWriter:
     def set_scope(self, scope_type: int, name: str, component: str = "") -> None:
         component = component or name
         self._scope_stack.append((name, component))
+        self._scope_count += 1
         buf = bytearray()
         buf.append(FST_ST_VCD_SCOPE)
         buf.append(scope_type)
@@ -166,7 +168,7 @@ class FstWriter:
         buf.extend(struct.pack(">Q", self._end_time))
         buf.extend(struct.pack("<d", FST_DOUBLE_ENDTEST))
         buf.extend(struct.pack(">Q", 0))
-        buf.extend(struct.pack(">Q", len(self._scope_stack)))
+        buf.extend(struct.pack(">Q", self._scope_count))
         buf.extend(struct.pack(">Q", self._handle_counter))
         buf.extend(struct.pack(">Q", self._handle_counter))
         buf.extend(struct.pack(">Q", 1))

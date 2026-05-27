@@ -66,7 +66,9 @@ class FstWriter:
         self.use_compressed_hier = use_compressed_hier
         self.pack_type = pack_type
         self._handle_counter = 0
+        self._var_count = 0
         self._vars: dict[int, _VarInfo] = {}
+        self._handle_info: dict[int, _VarInfo] = {}
         self._scope_stack: list[tuple[str, str]] = []
         self._scope_count = 0
         self._hier_events: list[bytes] = []
@@ -112,17 +114,30 @@ class FstWriter:
         alias_handle: int = 0,
         is_string: bool = False,
     ) -> int:
-        if not is_string and length == 0:
-            raise ValueError("reals (length=0, is_string=False) are not yet supported")
+        REAL_TYPES = {
+            FstVarType.VCD_REAL, FstVarType.VCD_REAL_PARAMETER,
+            FstVarType.VCD_REALTIME, FstVarType.SV_SHORTREAL,
+        }
+        if var_type in REAL_TYPES:
+            raise NotImplementedError(
+                "real-valued FST variables are not supported by writer yet"
+            )
+        self._var_count += 1
         if alias_handle == 0:
             self._handle_counter += 1
             handle = self._handle_counter
+            info = _VarInfo(
+                var_type=var_type, direction=direction, name=name,
+                length=length, alias_handle=0, is_string=is_string,
+            )
+            self._handle_info[handle] = info
+            self._vars[handle] = info
         else:
             handle = alias_handle
-        self._vars[handle] = _VarInfo(
-            var_type=var_type, direction=direction, name=name,
-            length=length, alias_handle=alias_handle, is_string=is_string,
-        )
+            self._vars[handle] = _VarInfo(
+                var_type=var_type, direction=direction, name=name,
+                length=length, alias_handle=alias_handle, is_string=is_string,
+            )
         buf = bytearray()
         buf.append(var_type)
         buf.append(direction)
@@ -139,9 +154,26 @@ class FstWriter:
         if time > self._end_time:
             self._end_time = time
 
+    def _validate_handle(self, handle: int, value: bytes) -> _VarInfo:
+        if handle not in self._handle_info:
+            raise KeyError(f"unknown FST handle: {handle}")
+        info = self._handle_info[handle]
+        if not info.is_string:
+            if info.length <= 1:
+                if value not in (b"0", b"1", b"x", b"z", b"h", b"u", b"w", b"l", b"-", b"?"):
+                    raise ValueError(
+                        f"invalid 1-bit value for handle {handle}: {value!r}"
+                    )
+            elif len(value) != info.length:
+                raise ValueError(
+                    f"value length {len(value)} != signal width {info.length} "
+                    f"for handle {handle}"
+                )
+        return info
+
     def emit_value_change(self, handle: int, value: bytes) -> None:
-        vi = self._vars.get(handle)
-        is_string = bool(vi and vi.is_string)
+        info = self._validate_handle(handle, value)
+        is_string = info.is_string
         self._vc_records.append(_VcRecord(
             time_delta=self._current_time, handle=handle, value=value,
             is_string=is_string,
@@ -185,7 +217,7 @@ class FstWriter:
         buf.extend(struct.pack("<d", FST_DOUBLE_ENDTEST))
         buf.extend(struct.pack(">Q", 0))
         buf.extend(struct.pack(">Q", self._scope_count))
-        buf.extend(struct.pack(">Q", self._handle_counter))
+        buf.extend(struct.pack(">Q", self._var_count))
         buf.extend(struct.pack(">Q", self._handle_counter))
         buf.extend(struct.pack(">Q", vc_section_count))
         ts_byte = self.timescale & 0xFF

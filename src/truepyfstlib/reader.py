@@ -93,6 +93,7 @@ class FstReader:
         self._hierarchy_events: list = []
         self._vc_sections: list[VcSection] = []
         self._handle_to_var: dict[int, 'FstVar'] = {}
+        self._vars_by_handle: dict[int, list['FstVar']] = {}
         self._parse_geometry_and_hierarchy()
         self._build_handle_map()
         self._parse_vc_sections()
@@ -280,10 +281,16 @@ class FstReader:
         self._hierarchy_events = self._parse_hierarchy(hier_data)
 
     def _build_handle_map(self) -> None:
-        """Build handle->FstVar lookup dict."""
+        """Build handle->FstVar lookup dict.
+
+        The first (non-alias) var for each handle is canonical.
+        Subsequent aliases are stored in _vars_by_handle.
+        """
         for e in self._hierarchy_events:
             if isinstance(e, FstVar):
-                self._handle_to_var[e.handle] = e
+                if e.handle not in self._handle_to_var:
+                    self._handle_to_var[e.handle] = e
+                self._vars_by_handle.setdefault(e.handle, []).append(e)
 
     @staticmethod
     def _is_vc_block(b: FstBlock) -> bool:
@@ -455,8 +462,12 @@ class FstReader:
 
     @property
     def handle_to_var(self) -> dict[int, 'FstVar']:
-        """Map signal handle (1-indexed) to FstVar."""
+        """Map signal handle (1-indexed) to canonical FstVar."""
         return self._handle_to_var
+
+    def vars_by_handle(self, handle: int) -> list['FstVar']:
+        """Return all FstVar entries (canonical + aliases) for a handle."""
+        return self._vars_by_handle.get(handle, [])
 
     def scopes(self) -> list[FstScope]:
         return [e for e in self._hierarchy_events if isinstance(e, FstScope)]
@@ -578,8 +589,8 @@ class FstReader:
         sect = self._vc_sections[section_index]
         times = sect.times
         max_handle = self.header.max_handle
-        sig_lens = self._signal_lengths
-        sig_typs = self._signal_types
+        sig_lens = list(self._signal_lengths)
+        sig_typs = list(self._signal_types)
         while len(sig_lens) < max_handle:
             sig_lens.append(1)
         while len(sig_typs) < max_handle:

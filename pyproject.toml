@@ -26,6 +26,5 @@ classifiers = [
 Homepage = "https://github.com/neveltyc/PurePyFstlib"
 Repository = "https://github.com/neveltyc/PurePyFstlib"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-packages = ["."]
+[tool.setuptools.packages.find]
+where = ["src"]

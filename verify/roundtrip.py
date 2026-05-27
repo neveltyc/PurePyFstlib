@@ -3,8 +3,8 @@
 import tempfile
 from pathlib import Path
 
-from src import FstWriter, FstReader
-from src.common import FstScopeType, FstVarType, FstVarDir
+from truepyfstlib import FstWriter, FstReader
+from truepyfstlib.common import FstScopeType, FstVarType, FstVarDir
 
 
 def test_single_bit_signal():

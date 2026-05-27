@@ -50,9 +50,10 @@ def read_svarint(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[int
     """Read a signed varint (zig-zag encoded)."""
     val, used = read_varint(buf, off)
     # zig-zag decode
+    ret = val >> 1
     if val & 1:
-        return -((val + 1) >> 1), used
-    return (val >> 1), used
+        ret = -ret
+    return ret, used
 
 
 def read_svarint64(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[int, int]:

@@ -504,7 +504,7 @@ class FstReader:
         initial = self.get_initial_value(handle, section_index)
         yield (sect.beg_time, initial)
 
-        if chain_off <= 0 or chain_len <= 0:
+        if chain_off < 0 or chain_len <= 0:
             return
         payload = self._data
         vc_data_start = sect.block_offset + 9 + sect.vc_start
@@ -517,7 +517,7 @@ class FstReader:
         if comp_size:
             # Compressed data follows
             from .compression import decompress_block
-            comp_body = vc_data[cskip:cskip + chain_len - cskip]
+            comp_body = vc_data[cskip:cskip + chain_len]
             vc_data = decompress_block(comp_body, sect.pack_type, comp_size)
         else:
             # Uncompressed: skip the marker
@@ -580,7 +580,7 @@ class FstReader:
                 continue
             chain_off = sect.chain_table[idx]
             chain_len = sect.chain_table_lengths[idx]
-            if chain_off <= 0 or chain_len <= 0:
+            if chain_off < 0 or chain_len <= 0:
                 continue
             vc_data_start = sect.block_offset + 9 + sect.vc_start
             start = vc_data_start + chain_off

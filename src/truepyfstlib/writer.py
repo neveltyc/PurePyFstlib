@@ -45,6 +45,14 @@ class _VcRecord:
     is_string: bool = False
 
 
+@dataclass
+class _VcSection:
+    records: list
+    begin_time: int
+    end_time: int
+    frame_snapshot: dict
+
+
 class FstWriter:
 
     def __init__(
@@ -64,7 +72,7 @@ class FstWriter:
         self.filetype = filetype
         self._handle_counter = 0
         self._var_count = 0
-        self._vars: dict[int, _VarInfo] = {}
+        self._vars_by_handle: dict[int, list[_VarInfo]] = {}
         self._handle_info: dict[int, _VarInfo] = {}
         self._scope_stack: list[tuple[str, str]] = []
         self._scope_count = 0
@@ -72,9 +80,11 @@ class FstWriter:
         self._vc_records: list[_VcRecord] = []
         self._blackouts: list[tuple[int, bool]] = []
         self._current_time: int = start_time
+        self._section_begin_time: int = start_time
         self._end_time: int = start_time
         self._closed = False
-        self._sections: list[tuple[list[_VcRecord], int]] = []
+        self._sections: list[_VcSection] = []
+        self._current_values: dict[int, bytes] = {}
 
     def set_timescale(self, ts: int) -> None:
         self.timescale = ts
@@ -121,10 +131,18 @@ class FstWriter:
         self._blackouts.append((self._current_time, enable))
 
     def flush_context(self) -> None:
-        if self._vc_records:
-            self._sections.append((list(self._vc_records), self._end_time))
-            self._vc_records.clear()
-        self._current_time = self.start_time
+        if not self._vc_records:
+            return
+        self._sections.append(
+            _VcSection(
+                records=list(self._vc_records),
+                begin_time=self._section_begin_time,
+                end_time=self._current_time,
+                frame_snapshot=dict(self._current_values),
+            )
+        )
+        self._vc_records.clear()
+        self._section_begin_time = self._current_time
 
     def create_var(
         self,
@@ -152,13 +170,21 @@ class FstWriter:
                 length=length, alias_handle=0, is_string=is_string,
             )
             self._handle_info[handle] = info
-            self._vars[handle] = info
+            self._vars_by_handle.setdefault(handle, []).append(info)
+            # init current value
+            if is_string:
+                self._current_values[handle] = b""
+            else:
+                self._current_values[handle] = b"0" * length
         else:
+            if alias_handle not in self._handle_info:
+                raise KeyError(f"unknown alias handle: {alias_handle}")
             handle = alias_handle
-            self._vars[handle] = _VarInfo(
+            alias_info = _VarInfo(
                 var_type=var_type, direction=direction, name=name,
                 length=length, alias_handle=alias_handle, is_string=is_string,
             )
+            self._vars_by_handle.setdefault(handle, []).append(alias_info)
         buf = bytearray()
         buf.append(var_type)
         buf.append(direction)
@@ -199,9 +225,12 @@ class FstWriter:
             time_delta=self._current_time, handle=handle, value=value,
             is_string=is_string,
         ))
+        self._current_values[handle] = value
 
     def emit_value_change_bit(self, handle: int, bit: int) -> None:
-        self.emit_value_change(handle, bytes([0x30 | (bit & 1)]))
+        if bit not in (0, 1):
+            raise ValueError("bit must be 0 or 1")
+        self.emit_value_change(handle, b"1" if bit else b"0")
 
     def close(self) -> None:
         if self._closed:
@@ -214,7 +243,14 @@ class FstWriter:
         result = bytearray()
         # Snapshot any pending section
         if self._vc_records:
-            self._sections.append((list(self._vc_records), self._end_time))
+            self._sections.append(
+                _VcSection(
+                    records=list(self._vc_records),
+                    begin_time=self._section_begin_time,
+                    end_time=self._end_time,
+                    frame_snapshot=dict(self._current_values),
+                )
+            )
         # vc_section_count
         self._vc_section_count = len(self._sections)
         hdr = self._build_header()
@@ -223,8 +259,8 @@ class FstWriter:
         result.extend(self._wrap_block(FST_BL_HDR, hdr))
         result.extend(self._wrap_block(FST_BL_GEOM, geom_blk))
         result.extend(self._wrap_block(FST_BL_HIER, hier_blk))
-        for section_idx, (records, end_time) in enumerate(self._sections):
-            for vc_blk in self._build_vc_sections(records, end_time, section_idx):
+        for section_idx, section in enumerate(self._sections):
+            for vc_blk in self._build_vc_sections(section, section_idx):
                 result.extend(vc_blk)
         # Blackout block (after VCDATA sections, per fstapi format)
         if self._blackouts:
@@ -233,7 +269,7 @@ class FstWriter:
 
     def _build_header(self) -> bytes:
         # vc_section_count must match the number of VCDATA blocks written.
-        vc_section_count = max(self._vc_section_count, 1) if (self._vc_records or self._sections) else 0
+        vc_section_count = self._vc_section_count if self._vc_section_count > 0 else (1 if self._handle_counter > 0 else 0)
         buf = bytearray()
         buf.extend(struct.pack(">Q", self.start_time))
         buf.extend(struct.pack(">Q", self._end_time))
@@ -269,7 +305,7 @@ class FstWriter:
         # with no dumped values.
         geom_data = bytearray()
         for h in range(1, self._handle_counter + 1):
-            vi = self._vars.get(h)
+            vi = self._handle_info.get(h)
             if vi is None:
                 geom_data.extend(write_varint(0xFFFFFFFF))  # unknown → treat as string
             elif vi.is_string:
@@ -300,14 +336,54 @@ class FstWriter:
         buf.extend(compressed)
         return bytes(buf)
 
-    def _build_vc_sections(self, records=None, end_time=None, section_idx=0) -> list[bytes]:
-        if records is None:
-            records = self._vc_records
-        if not records:
+    def _build_vc_sections(self, section=None, section_idx=0) -> list[bytes]:
+        if section is None:
             return []
-        all_records = list(records)
+        all_records = list(section.records)
+        if not all_records:
+            # Empty section with variables: emit time-0 frame-only section
+            frame_data = bytearray()
+            for h in range(1, self._handle_counter + 1):
+                vi = self._handle_info.get(h)
+                if vi is None:
+                    continue
+                if h in section.frame_snapshot:
+                    val = section.frame_snapshot[h]
+                    if not vi.is_string:
+                        frame_data.extend(val)
+                else:
+                    if not vi.is_string:
+                        frame_data.extend(b"0" * vi.length)
+            frame_bytes = bytes(frame_data)
+            frame_compressed = zlib.compress(frame_bytes)
+            block_body = bytearray()
+            block_body.extend(struct.pack(">Q", section.begin_time))
+            block_body.extend(struct.pack(">Q", section.end_time))
+            block_body.extend(struct.pack(">Q", 0))
+            block_body.extend(write_varint(len(frame_bytes)))
+            block_body.extend(write_varint(len(frame_compressed)))
+            block_body.extend(write_varint(self._handle_counter))
+            block_body.extend(frame_compressed)
+            block_body.extend(write_varint(self._handle_counter))
+            block_body.append(ord("Z"))
+            # empty chain table
+            chain_cmem = self._build_chain_table([0] * self._handle_counter, [False] * self._handle_counter)
+            block_body.extend(chain_cmem)
+            block_body.extend(struct.pack(">Q", len(chain_cmem)))
+            # empty time table
+            time_comp = zlib.compress(b"")
+            block_body.extend(time_comp)
+            block_body.extend(struct.pack(">Q", 0))
+            block_body.extend(struct.pack(">Q", len(time_comp)))
+            block_body.extend(struct.pack(">Q", 0))
+            total_len = 8 + len(block_body)
+            hdr = bytearray()
+            hdr.append(FST_BL_VCDATA)
+            hdr.extend(struct.pack(">Q", total_len))
+            return [bytes(hdr) + bytes(block_body)]
         times = sorted(set(r.time_delta for r in all_records))
-        section_end = end_time if end_time is not None else self._end_time
+        section_begin = section.begin_time
+        section_end = section.end_time
         max_handle = self._handle_counter
 
         # frame_data layout per libfst convention (fstapi.c:5208-5350 reader,
@@ -324,8 +400,18 @@ class FstWriter:
         # drops subsequent dumpvars lines.
         frame_data = bytearray()
         for h in range(1, max_handle + 1):
-            vi = self._vars.get(h)
+            vi = self._handle_info.get(h)
             if vi is None:
+                # No canonical var for this handle
+                continue
+            elif h in section.frame_snapshot:
+                snap = section.frame_snapshot[h]
+                if vi.is_string:
+                    continue
+                frame_data.extend(snap)
+                continue
+            if False:
+                pass  # dead, keep indent structure
                 # Unknown handle: treat as 1-bit wire with '0' initial.
                 frame_data.append(0x30)
             elif vi.is_string:
@@ -345,7 +431,7 @@ class FstWriter:
         # Build per-handle VC chunks with correct offsets
         handle_chunks: dict[int, bytes] = {}
         for h in range(1, max_handle + 1):
-            vi = self._vars.get(h)
+            vi = self._handle_info.get(h)
             if vi is None:
                 handle_chunks[h] = b""
                 continue
@@ -433,7 +519,7 @@ class FstWriter:
         # reader's destlen for chunk i = len(handle_chunks[h]).
         mem_required = sum(len(c) for c in handle_chunks.values())
         block_body = bytearray()
-        block_body.extend(struct.pack(">Q", self.start_time if section_idx == 0 else section_end))
+        block_body.extend(struct.pack(">Q", section_begin))
         block_body.extend(struct.pack(">Q", section_end))
         block_body.extend(struct.pack(">Q", mem_required))
         block_body.extend(write_varint(len(frame_bytes)))

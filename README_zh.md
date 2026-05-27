@@ -55,7 +55,7 @@ w.emit_value_change_bit(1, 0)
 w.close()
 ```
 
-更多示例见 [tests/verify_roundtrip.py](tests/verify_roundtrip.py)。
+更多示例见 [verify/roundtrip.py](verify/roundtrip.py)。
 
 ## 许可
 

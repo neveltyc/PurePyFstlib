@@ -1,28 +1,30 @@
-__pycache__/
 *.py[cod]
+__pycache__/
 *.egg-info/
 dist/
 build/
 .venv/
 *.fst
 
-# Debug/temp scripts
+# IDE / OS artifacts
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+__MACOSX/
+
+# Reference material (not part of this project)
+pylibfst-0.2.1/
+libfst/
+*.tar.gz
+*.zip
+
+# Temp / debug scripts
 debug_*.py
 fix_*.py
 patch_*.py
-test_write.py
-test_rt.py
-test_single.py
-test_multi.py
-test_read2.py
-pure_fst_reader.py
 add_chain.py
-
-# pylibfst reference
-pylibfst-0.2.1/
-pylibfst-0.2.1.tar.gz
+_*.py
 counter.fst
 transaction.fst
-libfst/
-libfst.zip
-__MACOSX/

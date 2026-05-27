@@ -282,7 +282,7 @@ def test_reader_mmap_context_manager_and_no_read_bytes_copy() -> None:
     w.emit_value_change(h, b"1")
     w.close()
 
-    with FstReader(str(p), use_mmap=True) as r:
+    with FstReader(str(p)) as r:
         assert r.header.max_handle == 1
         assert list(r.iter_value_changes(h)) == [(0, b"1")]
         # Normal, non-ZWRAPPER files should be mmap-backed instead of copied
@@ -292,6 +292,68 @@ def test_reader_mmap_context_manager_and_no_read_bytes_copy() -> None:
     r2 = FstReader(str(p), use_mmap=False)
     assert list(r2.iter_value_changes(h)) == [(0, b"1")]
     r2.close()
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
+    p.unlink(missing_ok=True)
+
+
+def test_reader_random_access_signal_and_time_window() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    w.set_scope(FstScopeType.VCD_MODULE, "u0")
+    h_state = w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 4, "state")
+    h_flag = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "flag")
+    w.set_upscope()
+    w.set_scope(FstScopeType.VCD_MODULE, "u1")
+    h_data = w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 8, "data")
+    w.set_upscope()
+    w.set_upscope()
+
+    w.emit_time_change(0)
+    w.emit_value_change(h_state, b"0000")
+    w.emit_value_change_bit(h_flag, 0)
+    w.emit_value_change(h_data, b"00000000")
+    w.emit_time_change(10)
+    w.emit_value_change(h_state, b"0001")
+    w.flush_context()
+    w.emit_time_change(20)
+    w.emit_value_change(h_state, b"0010")
+    w.emit_time_change(30)
+    w.emit_value_change_bit(h_flag, 1)
+    w.emit_value_change(h_data, b"11110000")
+    w.close()
+
+    r = FstReader(str(p))
+    assert r.find_handle("top.u0.state") == h_state
+    assert set(r.find_handles("top.u0.*")) == {h_state, h_flag}
+    assert r.names_for_handle(h_state) == ["top.u0.state"]
+    assert r.sections_overlapping(15, 25) == [1]
+    assert r.section_for_time(15) == 1
+
+    assert r.get_value_at(h_state, 5) == b"0000"
+    assert r.get_value_at(h_state, 15) == b"0001"
+    assert r.get_value_at(h_state, 25) == b"0010"
+    assert r.get_value_at("top.u0.state", 25, decoded=True) == "0010"
+
+    assert list(r.iter_value_changes_range(h_state, 15, 25, include_initial=True)) == [
+        (15, b"0001"),
+        (20, b"0010"),
+    ]
+    assert list(r.iter_value_changes_range("top.u0.state", 20, 25, include_initial=True)) == [
+        (20, b"0010"),
+    ]
+    # Range iteration without include_initial should not leak synthetic section
+    # snapshots for signals that did not change inside the requested window.
+    assert list(r.iter_value_changes_range(h_flag, 15, 25)) == []
+    grouped = list(r.iter_selected_changes(
+        ["top.u0.state", "top.u0.flag"], 15, 25, include_initial=True, decoded=True
+    ))
+    assert grouped[0] == (15, [(h_state, "0001"), (h_flag, "0")])
+    assert grouped[1] == (20, [(h_state, "0010")])
     try:
         r.close()
     except (NameError, OSError):
@@ -308,6 +370,7 @@ def main() -> None:
         test_reader_attaches_sv_vhdl_metadata,
         test_reader_reports_unknown_attr_payload_as_text,
         test_reader_mmap_context_manager_and_no_read_bytes_copy,
+        test_reader_random_access_signal_and_time_window,
     ]
     for t in tests:
         t()

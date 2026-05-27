@@ -29,6 +29,9 @@ import zlib
 import base64
 import mmap
 import bisect
+import fnmatch
+import re
+import heapq
 
 from .common import (
     FstBlockType, FstHeader, FstScope, FstVar, FstUpscope,
@@ -133,7 +136,9 @@ class FstReader:
         self._attributes_by_handle: dict[int, tuple[FstAttrBegin, ...]] = {}
         self._parse_geometry_and_hierarchy()
         self._build_handle_map()
+        self._build_signal_index()
         self._parse_vc_sections()
+        self._build_section_time_index()
         self._parse_blackouts()
         self._blackout_times = [t for t, _ in self._blackouts]
         self._blackout_states = [a for _, a in self._blackouts]
@@ -179,12 +184,6 @@ class FstReader:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
-
-    def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
 
     @staticmethod
     def _scan_blocks(data: bytes | bytearray | memoryview | mmap.mmap) -> list[FstBlock]:
@@ -543,6 +542,18 @@ class FstReader:
                     self._handle_to_var[e.handle] = e
                 self._vars_by_handle.setdefault(e.handle, []).append(e)
 
+    def _build_signal_index(self) -> None:
+        """Build name/handle indexes for random-access signal lookup."""
+        self._full_name_to_handles: dict[str, list[int]] = {}
+        self._short_name_to_handles: dict[str, list[int]] = {}
+        self._handle_to_full_names: dict[int, list[str]] = {}
+        for var in self.vars():
+            self._full_name_to_handles.setdefault(var.full_name, []).append(var.handle)
+            self._short_name_to_handles.setdefault(var.name, []).append(var.handle)
+            names = self._handle_to_full_names.setdefault(var.handle, [])
+            if var.full_name not in names:
+                names.append(var.full_name)
+
     @staticmethod
     def _is_vc_block(b: FstBlock) -> bool:
         return b.block_type in FstReader.VCDATA_BLOCK_TYPES
@@ -586,6 +597,11 @@ class FstReader:
             sect.times = self._parse_time_table(payload)
             self._parse_chain_table(sect, payload)
             self._vc_sections.append(sect)
+
+    def _build_section_time_index(self) -> None:
+        """Build section begin/end arrays for time-window queries."""
+        self._section_beg_times: list[int] = [int(s.beg_time) for s in self._vc_sections]
+        self._section_end_times: list[int] = [int(s.end_time) for s in self._vc_sections]
 
     def _parse_time_table(self, payload: bytes) -> list[int]:
         n = len(payload)
@@ -906,6 +922,208 @@ class FstReader:
             return bytes(value)
         return bytes(value).decode("ascii", errors="replace")
 
+    def signal_names(self, *, include_aliases: bool = True) -> list[str]:
+        """Return full signal names known to the hierarchy index."""
+        if include_aliases:
+            return sorted(self._full_name_to_handles)
+        return sorted(v.full_name for v in self._handle_to_var.values())
+
+    def names_for_handle(self, handle: int) -> list[str]:
+        """Return full hierarchy names associated with a handle."""
+        return list(self._handle_to_full_names.get(int(handle), []))
+
+    def find_handle(self, name: str, *, include_aliases: bool = True) -> int:
+        """Return the first handle matching an exact full signal name.
+
+        ``include_aliases=False`` restricts lookup to canonical handle names.
+        Raises KeyError if the name is not present.  Use ``find_handles()`` for
+        wildcard/regex matching or when multiple aliases should be preserved.
+        """
+        if include_aliases:
+            handles = self._full_name_to_handles.get(str(name), [])
+        else:
+            handles = [h for h, v in self._handle_to_var.items() if v.full_name == str(name)]
+        if not handles:
+            raise KeyError(f"unknown signal name: {name}")
+        return int(handles[0])
+
+    def find_handles(
+        self, pattern: str | None = None, *, regex: bool = False,
+        include_aliases: bool = True, unique: bool = True,
+    ) -> list[int]:
+        """Find handles by full-name wildcard or regular expression.
+
+        ``pattern=None`` returns all known handles.  Wildcards use
+        ``fnmatchcase`` semantics; regex mode uses ``re.search``.  When
+        ``unique=True`` aliases are collapsed to one handle value.
+        """
+        if include_aliases:
+            items = self._full_name_to_handles.items()
+        else:
+            items = ((v.full_name, [h]) for h, v in self._handle_to_var.items())
+        if pattern is None:
+            out = [h for _, handles in items for h in handles]
+        elif regex:
+            rx = re.compile(pattern)
+            out = [h for name, handles in items if rx.search(name) for h in handles]
+        else:
+            out = [h for name, handles in items if fnmatch.fnmatchcase(name, pattern) for h in handles]
+        if unique:
+            return sorted(set(int(h) for h in out))
+        return [int(h) for h in out]
+
+    def _resolve_handle(self, handle_or_name: int | str) -> int:
+        if isinstance(handle_or_name, str):
+            return self.find_handle(handle_or_name)
+        return int(handle_or_name)
+
+    def sections_overlapping(self, start: int | None = None, end: int | None = None) -> list[int]:
+        """Return VCDATA section indexes whose time range overlaps [start, end].
+
+        This is the section-level time index used by random-access queries.
+        It skips sections whose ``end_time < start`` or ``beg_time > end``.
+        """
+        if not self._vc_sections:
+            return []
+        lo = self.header.start_time if start is None else int(start)
+        hi = self.header.end_time if end is None else int(end)
+        if hi < lo:
+            return []
+        idx = bisect.bisect_left(self._section_end_times, lo)
+        out: list[int] = []
+        while idx < len(self._vc_sections) and self._section_beg_times[idx] <= hi:
+            if self._section_end_times[idx] >= lo:
+                out.append(idx)
+            idx += 1
+        return out
+
+    def section_for_time(self, time: int) -> int | None:
+        """Return the section whose frame should be used for ``time``.
+
+        If ``time`` falls in a gap after a section, the preceding section is
+        returned because signal values persist until changed.  If ``time`` is
+        before the first section, section 0 is returned so callers can use the
+        first frame snapshot.
+        """
+        if not self._vc_sections:
+            return None
+        t = int(time)
+        idx = bisect.bisect_right(self._section_beg_times, t) - 1
+        if idx < 0:
+            return 0
+        if idx >= len(self._vc_sections):
+            return len(self._vc_sections) - 1
+        return idx
+
+    def get_value_at(
+        self, handle: int | str, time: int, *, decoded: bool = False,
+        respect_blackout: bool = False,
+    ):
+        """Return a handle's value at ``time`` using section/frame indexing.
+
+        Only the selected handle's chain in the relevant section is decoded.
+        With ``respect_blackout=True``, ``None`` is returned when the queried
+        time is in a dump-inactive interval.
+        """
+        h = self._resolve_handle(handle)
+        t = int(time)
+        if respect_blackout and not self.is_dump_active_at(t):
+            return None
+        section_index = self.section_for_time(t)
+        if section_index is None:
+            return None
+        val = self.get_initial_value(h, section_index)
+        for et, ev in self.iter_value_changes(h, section_index, respect_blackout=respect_blackout):
+            if et > t:
+                break
+            val = ev
+        return self.decode_value(h, val) if decoded else val
+
+    def iter_value_changes_range(
+        self, handle: int | str, start: int | None = None, end: int | None = None,
+        *, include_initial: bool = False, respect_blackout: bool = False,
+    ) -> Iterator[tuple[int, bytes]]:
+        """Iterate one signal's changes within a time window.
+
+        The reader first skips non-overlapping VCDATA sections, then decodes
+        only this handle's chain in the remaining sections.  When
+        ``include_initial=True``, a synthetic snapshot at ``start`` is emitted
+        first and explicit changes at exactly ``start`` are suppressed because
+        the snapshot already includes them.
+        """
+        h = self._resolve_handle(handle)
+        lo = self.header.start_time if start is None else int(start)
+        hi = self.header.end_time if end is None else int(end)
+        if hi < lo:
+            return
+        if include_initial:
+            init = self.get_value_at(h, lo, respect_blackout=respect_blackout)
+            if init is not None:
+                yield lo, init
+        for section_index in self.sections_overlapping(lo, hi):
+            for t, v in self.iter_value_changes(
+                h, section_index, respect_blackout=respect_blackout,
+                _include_section_initial=False,
+            ):
+                if t < lo or (include_initial and t <= lo):
+                    continue
+                if t > hi:
+                    break
+                yield t, v
+
+    def iter_decoded_value_changes_range(
+        self, handle: int | str, start: int | None = None, end: int | None = None,
+        *, include_initial: bool = False, respect_blackout: bool = False,
+    ) -> Iterator[tuple[int, object]]:
+        h = self._resolve_handle(handle)
+        for t, v in self.iter_value_changes_range(
+            h, start, end, include_initial=include_initial, respect_blackout=respect_blackout
+        ):
+            yield t, self.decode_value(h, v)
+
+    def iter_selected_changes(
+        self, handles: list[int | str] | tuple[int | str, ...],
+        start: int | None = None, end: int | None = None, *,
+        include_initial: bool = False, decoded: bool = False,
+        respect_blackout: bool = False,
+    ) -> Iterator[tuple[int, list[tuple[int, object]]]]:
+        """Iterate selected signal changes grouped by time.
+
+        This is the API intended for wavecut/agent queries: it decodes only the
+        requested handles, groups their events by timestamp, and skips
+        non-overlapping sections.
+        """
+        resolved = [self._resolve_handle(h) for h in handles]
+        heap: list[tuple[int, int, int, bytes, Iterator[tuple[int, bytes]]]] = []
+        for seq, h in enumerate(resolved):
+            it = self.iter_value_changes_range(
+                h, start, end, include_initial=include_initial, respect_blackout=respect_blackout
+            )
+            try:
+                t, v = next(it)
+            except StopIteration:
+                continue
+            heapq.heappush(heap, (int(t), seq, h, v, it))
+
+        while heap:
+            t = heap[0][0]
+            changes: list[tuple[int, object]] = []
+            pending_next: list[tuple[int, int, int, bytes, Iterator[tuple[int, bytes]]]] = []
+            while heap and heap[0][0] == t:
+                _, seq, h, v, it = heapq.heappop(heap)
+                changes.append((h, self.decode_value(h, v) if decoded else v))
+                try:
+                    nt, nv = next(it)
+                except StopIteration:
+                    continue
+                pending_next.append((int(nt), seq, h, nv, it))
+            for item in pending_next:
+                heapq.heappush(heap, item)
+            yield t, changes
+
+    # More explicit alias for callers that prefer value-oriented naming.
+    iter_selected_value_changes = iter_selected_changes
+
     def get_initial_value_decoded(self, handle: int, section_index: int = 0):
         return self.decode_value(handle, self.get_initial_value(handle, section_index))
 
@@ -970,6 +1188,7 @@ class FstReader:
 
     def iter_value_changes(
         self, handle: int, section_index: int = 0, *, respect_blackout: bool = False,
+        _include_section_initial: bool = True,
     ) -> Iterator[tuple[int, bytes]]:
         if section_index >= len(self._vc_sections):
             return
@@ -977,9 +1196,10 @@ class FstReader:
         idx = handle - 1
 
         if idx >= len(sect.chain_table) or idx >= len(sect.chain_table_lengths):
-            initial = self.get_initial_value(handle, section_index)
-            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
-                yield (sect.beg_time, initial)
+            if _include_section_initial:
+                initial = self.get_initial_value(handle, section_index)
+                if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+                    yield (sect.beg_time, initial)
             return
 
         chain_off = sect.chain_table[idx]
@@ -987,14 +1207,14 @@ class FstReader:
 
         # Negative chain_len: dynamic alias, return only the initial value
         if chain_len < 0:
-            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+            if _include_section_initial and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
 
         if chain_off <= 0 or chain_len <= 0:
             if idx < len(self._signal_lengths) and not self._signal_lengths[idx]:
                 return  # string with no data: emit nothing (C reader behavior)
-            if not respect_blackout or self.is_dump_active_at(sect.beg_time):
+            if _include_section_initial and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
         payload = self._data

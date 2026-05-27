@@ -29,3 +29,4 @@ _*.py
 counter.fst
 transaction.fst
 _test.vcd
+todo/

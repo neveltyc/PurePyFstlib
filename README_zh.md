@@ -247,13 +247,12 @@ r.get_value_from_handle_at_time(handle, time, decoded=False)
 这些接口适合 analyzer、CLI 工具和 JSON 输出。
 
 ```python
-r.file_info()       # 稳定文件概览，替代旧的调试式 summary()
+r.file_info()       # 结构化文件概览
 r.block_table()     # 顶层 FST block 表
 r.signal_table()    # 信号表：handle、path、aliases、width、type、metadata 摘要
 r.section_table()   # VCDATA section 表：index、begin/end time、chain count、pack type
 ```
 
-`summary()` 不再作为稳定 API。请使用 `file_info()`。
 
 ### 信号查找
 

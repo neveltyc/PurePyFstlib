@@ -247,13 +247,12 @@ r.get_value_from_handle_at_time(handle, time, decoded=False)
 Use these for integration with analyzer scripts, CLI tools, and JSON-facing workflows.
 
 ```python
-r.file_info()       # stable file overview; replaces the old debug-style summary()
+r.file_info()       # structured file overview
 r.block_table()     # top-level FST block table
 r.signal_table()    # signal records: handle, path, aliases, width, type, metadata summary
 r.section_table()   # VCDATA section records: index, begin/end time, chain count, pack type
 ```
 
-`summary()` is intentionally not part of the stable API. Use `file_info()` instead.
 
 ### Signal lookup
 

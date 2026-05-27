@@ -1,14 +1,21 @@
-# PurePyFstlib
+<p align="center">
+  <h1 align="center">PurePyFstlib</h1>
+  <p align="center">
+    A pure-Python FST (Fast Signal Trace) reader and conservative writer
+    for portable waveform-debug tooling &mdash; no C extensions, no platform binding headaches.
+  </p>
+</p>
 
-**PurePyFstlib** is a pure-Python FST (Fast Signal Trace) reader and conservative writer for portable waveform-debug tooling.
-
-It is designed for environments where binding to `pylibfst` / GTKWave `libfst` is inconvenient, especially on Windows, CI systems, Python agents, and cross-platform debug tools. The goal is not to replace the original C implementation as a high-performance simulator dump backend. The goal is to make FST files easier to inspect, filter, slice, report, and repackage from Python without C extensions or platform-specific binary wheels.
-
-Current README target: **0.2.3**. For per-version details, see [`CHANGELOG.md`](CHANGELOG.md).
+<p align="center">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.3-3366cc?style=flat-square">
+  <img alt="Python" src="https://img.shields.io/badge/python-3.10+-3366cc?style=flat-square&logo=python&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-3366cc?style=flat-square">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-all%20passed-22aa55?style=flat-square">
+</p>
 
 ---
 
-## Why this project exists
+## Why PurePyFstlib?
 
 FST is increasingly useful for waveform-debug workflows because it is compact, GTKWave-friendly, and much easier to transmit than large VCD files. However, many Python workflows still depend on C-backed FST bindings. That creates friction:
 
@@ -45,7 +52,7 @@ large VCD/FST
 
 ---
 
-## Installation
+## Install
 
 From a local checkout:
 
@@ -65,73 +72,44 @@ The package is pure Python and requires no C compiler for normal installation.
 
 ## Quick start
 
-### Read an FST file
-
 ```python
 from truepyfstlib import FstReader
 
+# What's in this file?
 r = FstReader("waveform.fst")
 print(r.summary())
 
+# List all signals
 for var in r.vars():
     print(var.handle, var.full_name, var.length)
 
-# Raw value-change bytes for one handle.
+# Read raw value changes for one handle
 for time, value in r.iter_value_changes_all(handle=1, include_initial=True):
     print(time, value)
 
-# Decoded values for scalar/vector/real/string handles.
+# Read decoded values (float for real, str for vectors, bytes for strings)
 for time, value in r.iter_decoded_value_changes_all(handle=1, include_initial=True):
     print(time, value)
-```
 
-### Read attributes and metadata
-
-```python
-from truepyfstlib import FstReader
-
-r = FstReader("waveform.fst")
-
-# Reader-level metadata.
-print(r.comments)
-print(r.env_vars)
-print(r.enum_tables)
-print(r.source_paths)
-
-# Per-signal metadata.
-meta = r.metadata_for_handle(1)
-print(meta)
-
-# All hierarchy attributes, including unknown/vendor payloads.
+# All hierarchy attributes, including vendor/unknown payloads
 for item in r.attribute_report(decoded=True):
     print(item)
 
-# Text report for diagnostics or bug reports.
-print(r.attribute_report_text())
-```
+# Per-signal SV/VHDL metadata
+meta = r.metadata_for_handle(1)
+print(meta)
 
-### Apply blackout semantics when iterating
-
-```python
-from truepyfstlib import FstReader
-
-r = FstReader("waveform.fst")
-print(r.blackouts)
-print(r.is_dump_active_at(1000))
-
+# Apply blackout semantics
 for time, value in r.iter_value_changes_all(
-    handle=1,
-    include_initial=True,
-    respect_blackout=True,
+    handle=1, include_initial=True, respect_blackout=True,
 ):
     print(time, value)
 ```
 
-### Write a conservative FST file
-
 ```python
 from truepyfstlib import FstWriter, FstScopeType, FstVarType, FstVarDir
 
+# Write a conservative FST file (gzip hierarchy + zlib VCDATA)
 w = FstWriter("slice.fst", timescale=-9)
 w.set_scope(FstScopeType.VCD_MODULE, "top")
 clk = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "clk")
@@ -149,7 +127,7 @@ w.emit_value_change(data, b"10101010")
 w.close()
 ```
 
-The writer output is intentionally conservative: gzip hierarchy plus zlib VCDATA. This is the recommended output mode for Python-side waveform slicing and repackaging.
+The writer output is intentionally conservative: gzip hierarchy plus zlib VCDATA.
 
 ---
 
@@ -236,24 +214,15 @@ For unknown or third-party attributes, the reader preserves and reports the payl
 
 ## Project layout
 
-```text
-src/truepyfstlib/
-  common.py       # FST enums, dataclasses, public structures
-  compression.py  # pure-Python LZ4/FastLZ decompression helpers
-  reader.py       # FST reader, metadata, iterators, reports
-  varint.py       # FST varint encoding/decoding
-  writer.py       # conservative FST writer
-
-verify/
-  roundtrip.py        # small reader/writer roundtrip checks
-  verify_reader.py    # reader compatibility checks
-  verify_writer.py    # writer checks; uses fst2vcd when available
-  verify_golden.py    # golden fixture verification helper
+```
+src/truepyfstlib/       FST library (pure Python, stdlib only)
+verify/                 Test suite with fixtures and golden cross-checks
+CHANGELOG.md            Per-version release details
 ```
 
 ---
 
-## Verification
+## Tests
 
 Run the pure-Python checks:
 
@@ -285,10 +254,6 @@ python -c "import truepyfstlib; print(truepyfstlib.__version__)"
 ---
 
 ## Version history
-
-Per-version release details are maintained in [`CHANGELOG.md`](CHANGELOG.md).
-
-If a README-level release table is needed later, leave the per-version highlight field blank and let the local release agent fill it from `CHANGELOG.md`.
 
 ---
 

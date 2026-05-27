@@ -298,12 +298,7 @@ python -c "import truepyfstlib; print(truepyfstlib.__version__)"
 
 ## 版本历史
 
-每个版本的详细改动维护在 [`CHANGELOG.md`](CHANGELOG.md)。
-
-如果后续 README 需要版本表，版本说明字段可以先留空，由本地 release agent 根据 `CHANGELOG.md` 自动补齐。
-
----
-
+详见 [`CHANGELOG.md`](CHANGELOG.md)。
 ## 许可
 
 MIT。

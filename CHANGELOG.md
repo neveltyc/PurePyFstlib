@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0
+
+Stable info API and integration-friendly reader methods:
+
+- get_version_string, get_date_string, get_file_type: header metadata accessors
+- get_var_count, get_scope_count, get_alias_count, get_max_handle: counts
+- get_start_time, get_end_time, get_timescale, get_timezero: timing
+- file_info(): structured dict with block counts, filetype name, timescale
+- block_table(): list of all FST blocks with type names and byte offsets
+- section_table(): VCDATA sections with begin/end times and signal count
+- signal_table(): per-signal overview with width, type, direction,
+  change counts, string/real flags
+- resolve_handle(name): name-to-handle with direction inference
+- find_signal(name): single signal lookup returning a record dict
+- section_at_time(time): section index for a timestamp
+- iter_events(): flat time/value/event_type iterator
+- iter_event_groups(): per-timestamp grouped event batches
+- snapshot_at(time): signal value snapshot at a precise time point
+- format_value(handle, value): consistent text formatting for
+  bits, reals, strings, and x/z values
+- get_value_from_handle_at_time: libfst-compatible wrapper
+
 ## 0.3.0
 
 Signal index, time-window queries, and random-access APIs:

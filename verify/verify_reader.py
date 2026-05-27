@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import struct
+import json
 import tempfile
 from pathlib import Path
 
@@ -360,6 +361,81 @@ def test_reader_random_access_signal_and_time_window() -> None:
         pass
     p.unlink(missing_ok=True)
 
+
+def test_reader_stable_info_and_integration_api() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    w.set_version("api-test")
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h_state = w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 4, "state")
+    h_flag = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "flag")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change(h_state, b"0000")
+    w.emit_value_change_bit(h_flag, 0)
+    w.emit_time_change(5)
+    w.emit_value_change(h_state, b"0011")
+    w.emit_time_change(10)
+    w.emit_value_change_bit(h_flag, 1)
+    w.close()
+
+    r = FstReader(str(p))
+    assert not hasattr(r, "summary")
+
+    info = r.file_info()
+    json.dumps(info)
+    assert info["file"] == str(p)
+    assert info["version"] == "api-test"
+    assert info["var_count"] == 2
+    assert info["max_handle"] == 2
+    assert info["parsed_value_change_section_count"] == 1
+
+    blocks = r.block_table()
+    assert blocks and all("block_type_name" in b for b in blocks)
+    sections = r.section_table()
+    assert len(sections) == 1
+    assert sections[0]["begin_time"] == 0
+    assert sections[0]["end_time"] == 10
+
+    table = r.signal_table()
+    json.dumps(table)
+    assert [row["name"] for row in table] == ["top.state", "top.flag"]
+    assert r.find_signal("top.state")["handle"] == h_state
+    assert {row["handle"] for row in r.find_signals("top.*")} == {h_state, h_flag}
+    assert r.resolve_handle("top.state") == h_state
+    assert r.get_value_from_handle_at_time(h_state, 7) == b"0011"
+    assert r.get_value_from_handle_at_time("top.flag", 7, decoded=True) == "0"
+    assert r.section_at_time(7) == r.section_for_time(7) == 0
+
+    assert list(r.iter_events(0, 10, [h_state], decoded=True)) == [
+        (0, h_state, "0000"),
+        (5, h_state, "0011"),
+    ]
+    groups = list(r.iter_event_groups(0, 10, [h_state, h_flag], decoded=True))
+    assert groups[0] == (0, [(h_state, "0000"), (h_flag, "0")])
+    assert groups[-1] == (10, [(h_flag, "1")])
+    assert r.snapshot_at(7, [h_state, h_flag], decoded=True) == {
+        h_state: "0011",
+        h_flag: "0",
+    }
+    assert r.format_value(h_state, b"0011") == "3 (0x3)"
+    assert r.format_value(h_state, b"00xz") == "b00xz"
+
+    assert r.get_version_string() == "api-test"
+    assert r.get_var_count() == 2
+    assert r.get_scope_count() == 1
+    assert r.get_alias_count() == 0
+    assert r.get_start_time() == 0
+    assert r.get_end_time() == 10
+    assert r.get_value_change_section_count() == 1
+    assert r.get_max_handle() == 2
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
+    p.unlink(missing_ok=True)
+
 def main() -> None:
     tests = [
         test_reader_derives_geometry_from_hierarchy,
@@ -371,6 +447,7 @@ def main() -> None:
         test_reader_reports_unknown_attr_payload_as_text,
         test_reader_mmap_context_manager_and_no_read_bytes_copy,
         test_reader_random_access_signal_and_time_window,
+        test_reader_stable_info_and_integration_api,
     ]
     for t in tests:
         t()

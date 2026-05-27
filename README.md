@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.3.0-3366cc?style=flat-square">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.4.0-3366cc?style=flat-square">
   <img alt="Python" src="https://img.shields.io/badge/python-3.10+-3366cc?style=flat-square&logo=python&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-3366cc?style=flat-square">
 </p>
@@ -16,31 +16,66 @@
 
 ---
 
-## Why PurePyFstlib?
+## What is PurePyFstlib?
 
-FST is increasingly useful for waveform-debug workflows because it is compact, GTKWave-friendly, and much easier to transmit than large VCD files. However, many Python workflows still depend on C-backed FST bindings. That creates friction:
+PurePyFstlib is a pure-Python implementation of the FST waveform format.
 
-- prebuilt `pylibfst` packages are not always available on every platform;
-- Windows users may need local source builds and toolchain setup;
-- CI and agent environments often prefer pure-Python, source-distributable packages;
-- waveform tools that only need reading, slicing, metadata reporting, or compact artifact generation do not always need the full C writer stack.
+It is designed for Python waveform tooling that needs to **read real-world FST files**, inspect signal metadata, perform block/section/chain-level random access, and write a conservative GTKWave-readable FST subset for filtered waveform artifacts.
 
-PurePyFstlib takes a deliberately asymmetric approach:
+The project is intentionally asymmetric:
 
-- **Reader first:** accept as many common real-world FST files as possible.
-- **Writer conservative:** emit one stable, GTKWave-compatible FST subset instead of chasing every high-performance libfst writer path.
-- **No C extension dependency:** import and run as normal Python code.
-- **Tooling oriented:** useful as a backend for waveform filters, slicers, reporters, and agent-assisted RTL debug tools.
+- **Reader first.** The reader aims to support most common FST files produced by existing tools.
+- **Writer conservative.** The writer emits a small, stable subset: gzip-compressed hierarchy and zlib-compressed VCDATA.
+- **No C extension dependency.** It does not require `pylibfst`, GTKWave `libfst`, local C compilation, or platform-specific wheels.
+- **Tooling oriented.** It is meant to be used by waveform filters, slicers, reporters, and agent-assisted RTL debug tools.
+
+PurePyFstlib is **not** intended to replace GTKWave `libfst` as a high-performance simulator dump backend.
+
+---
+
+## Why not just use `pylibfst`?
+
+`pylibfst` and GTKWave `libfst` are the right choice when you need the native C implementation. However, they are less convenient when the goal is portable Python tooling:
+
+- prebuilt packages are not always available on every platform;
+- Windows users may need local source builds and a C toolchain;
+- CI, sandbox, and agent environments often prefer source-distributable pure-Python packages;
+- many debug tools need FST reading, slicing, reporting, or compact artifact generation, not a full simulator-grade writer stack.
+
+PurePyFstlib exists to make FST usable in these environments.
 
 ---
 
 ## Design position
 
-PurePyFstlib is not intended to be a drop-in performance replacement for GTKWave `libfst`.
+PurePyFstlib keeps the reader and writer roles separate.
 
-The reader aims to cover most common FST structures used by existing tools. The writer intentionally emits a smaller and conservative format: gzip-compressed hierarchy and zlib-compressed VCDATA. This is sufficient for use cases such as waveform slicing, VCD/FST filtering, compact debug artifacts, and GTKWave-readable outputs.
+### Reader
 
-The main expected use case is not full simulator waveform dumping. A more realistic use case is:
+The reader is the main value of this project. It tries to parse common FST structures broadly and expose stable low-level access primitives:
+
+```text
+FST file
+→ block index
+→ hierarchy / geometry
+→ signal table
+→ VCDATA section table
+→ handle-level chain access
+→ raw / decoded values
+→ metadata and blackout information
+```
+
+Reader APIs are designed to support tools such as waveform analyzers, wavecut/filter utilities, and agent workflows.
+
+### Writer
+
+The writer intentionally emits a conservative FST subset:
+
+```text
+HDR + GEOM + gzip HIER + zlib VCDATA
+```
+
+This is sufficient for post-processing workflows such as:
 
 ```text
 large VCD/FST
@@ -51,17 +86,19 @@ large VCD/FST
 → open directly in GTKWave or pass to another debug tool
 ```
 
+The writer does not try to reproduce every internal path of `libfst`, such as parallel writer modes, repack-on-close, writer-side LZ4/FastLZ packing, or dump-size-limit workflows.
+
 ---
 
 ## Install
+
+Development install:
 
 ```bash
 git clone https://github.com/neveltyc/PurePyFstlib.git
 cd PurePyFstlib
 pip install -e .
 ```
-
-Alternatively build a wheel:
 
 Build a wheel:
 
@@ -75,50 +112,97 @@ The package is pure Python and requires no C compiler for normal installation.
 
 ## Quick start
 
-Read waveform files and inspect signals, metadata, and value changes.
+### File and signal inspection
 
 ```python
 from truepyfstlib import FstReader
 
-# What's in this file?
-r = FstReader("waveform.fst")
-print(r.summary())
+with FstReader("waveform.fst") as r:
+    print(r.file_info())
 
-# List all signals
-for var in r.vars():
-    print(var.handle, var.full_name, var.length)
-
-# Read raw value changes for one handle
-for time, value in r.iter_value_changes_all(handle=1, include_initial=True):
-    print(time, value)
-
-# Read decoded values (float for real, str for vectors, bytes for strings)
-for time, value in r.iter_decoded_value_changes_all(handle=1, include_initial=True):
-    print(time, value)
-
-# All hierarchy attributes, including vendor/unknown payloads
-for item in r.attribute_report(decoded=True):
-    print(item)
-
-# Per-signal SV/VHDL metadata
-meta = r.metadata_for_handle(1)
-print(meta)
-
-# Apply blackout semantics
-for time, value in r.iter_value_changes_all(
-    handle=1, include_initial=True, respect_blackout=True,
-):
-    print(time, value)
+    for sig in r.signal_table():
+        print(sig["handle"], sig["path"], sig["width"], sig["type"])
 ```
+
+### Resolve a signal and read value changes
+
+```python
+from truepyfstlib import FstReader
+
+with FstReader("waveform.fst") as r:
+    handle = r.resolve_handle("top.u0.state")
+
+    for time, value in r.iter_value_changes_range(
+        handle,
+        start=1000,
+        end=2000,
+        include_initial=True,
+    ):
+        print(time, value)
+```
+
+### Random access by signal and time
+
+```python
+from truepyfstlib import FstReader
+
+with FstReader("waveform.fst") as r:
+    handle = r.resolve_handle("top.u0.state")
+
+    # Value of one signal at one time point.
+    print(r.get_value_at(handle, 1500, decoded=True))
+
+    # Snapshot of selected signals at one time point.
+    handles = r.find_handles("top.u0.*")
+    snap = r.snapshot_at(1500, handles=handles, decoded=True)
+    print(snap)
+```
+
+### Selected event stream for analyzers or wavecut tools
+
+```python
+from truepyfstlib import FstReader
+
+with FstReader("waveform.fst") as r:
+    handles = r.find_handles("top.u0.*")
+
+    for time, changes in r.iter_event_groups(
+        start=1000,
+        end=2000,
+        handles=handles,
+        decoded=True,
+        include_initial=True,
+    ):
+        print(time, changes)
+```
+
+### Metadata, attributes, and blackout information
+
+```python
+from truepyfstlib import FstReader
+
+with FstReader("waveform.fst") as r:
+    print(r.blackouts())
+    print(r.is_dump_active_at(1000))
+
+    for attr in r.attribute_report(decoded=True):
+        print(attr)
+
+    meta = r.metadata_for_handle(1)
+    print(meta)
+```
+
+### Write a conservative FST file
 
 ```python
 from truepyfstlib import FstWriter, FstScopeType, FstVarType, FstVarDir
 
-# Write a conservative FST file (gzip hierarchy + zlib VCDATA)
 w = FstWriter("slice.fst", timescale=-9)
 w.set_scope(FstScopeType.VCD_MODULE, "top")
+
 clk = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "clk")
 data = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "data")
+
 w.set_upscope()
 
 w.emit_time_change(0)
@@ -132,7 +216,175 @@ w.emit_value_change(data, b"10101010")
 w.close()
 ```
 
-The writer output is intentionally conservative: gzip hierarchy plus zlib VCDATA.
+---
+
+## Stable reader API
+
+This section is the intended public API surface for reader users. It is grouped by role so that waveform analyzers can depend on stable primitives instead of internal parser details.
+
+### File-level getters
+
+These methods follow the spirit of `libfst` reader getters, but use Python naming.
+
+```python
+r.get_version_string()
+r.get_date_string()
+r.get_file_type()
+r.get_var_count()
+r.get_scope_count()
+r.get_alias_count()
+r.get_start_time()
+r.get_end_time()
+r.get_timescale()
+r.get_timezero()
+r.get_value_change_section_count()
+r.get_max_handle()
+r.get_value_from_handle_at_time(handle, time, decoded=False)
+```
+
+### Stable structure tables
+
+Use these for integration with analyzer scripts, CLI tools, and JSON-facing workflows.
+
+```python
+r.file_info()       # stable file overview; replaces the old debug-style summary()
+r.block_table()     # top-level FST block table
+r.signal_table()    # signal records: handle, path, aliases, width, type, metadata summary
+r.section_table()   # VCDATA section records: index, begin/end time, chain count, pack type
+```
+
+`summary()` is intentionally not part of the stable API. Use `file_info()` instead.
+
+### Signal lookup
+
+Reader-level lookup is intentionally simple: exact name, glob, or regex. CLI-specific substring filtering and condition parsing belong in analyzer tools.
+
+```python
+r.signal_names(include_aliases=True)
+r.names_for_handle(handle)
+
+r.find_handle(name, include_aliases=True)
+r.find_handles(pattern=None, regex=False, include_aliases=True, unique=True)
+
+r.find_signal(name, include_aliases=True)
+r.find_signals(pattern=None, regex=False, include_aliases=True, unique=True)
+
+r.resolve_handle(query, regex=False, include_aliases=True)
+```
+
+Recommended convention:
+
+- use `find_handle()` when the input is an exact signal name;
+- use `find_handles()` / `find_signals()` when multiple matches are expected;
+- use `resolve_handle()` when the caller requires exactly one signal.
+
+### Section and time access
+
+FST VCDATA is block/section based. These APIs expose the random-time structure without forcing a full waveform scan.
+
+```python
+r.vc_sections()
+r.sections_overlapping(start=None, end=None)
+r.section_for_time(time)
+r.section_at_time(time)   # alias of section_for_time()
+```
+
+### Value access
+
+Use these APIs for signal-local access. They avoid decoding unrelated handles.
+
+```python
+r.get_initial_value(handle, section_index=0)
+r.get_initial_value_decoded(handle, section_index=0)
+
+r.iter_value_changes(handle, section_index=0, respect_blackout=False)
+r.iter_value_changes_all(handle, include_initial=False, respect_blackout=False)
+r.iter_value_changes_range(
+    handle,
+    start=None,
+    end=None,
+    include_initial=False,
+    respect_blackout=False,
+)
+
+r.get_value_at(handle_or_name, time, decoded=False, respect_blackout=False)
+```
+
+Decoded variants are also available:
+
+```python
+r.decode_value(handle, value)
+r.format_value(handle, value)
+
+r.iter_decoded_value_changes(...)
+r.iter_decoded_value_changes_all(...)
+r.iter_decoded_value_changes_range(...)
+```
+
+### Event streams for analyzers and wavecut tools
+
+These are thin reader-level primitives. They do not implement condition parsing, protocol interpretation, or debug reporting.
+
+```python
+r.iter_events(
+    start=None,
+    end=None,
+    handles=None,
+    decoded=False,
+    include_initial=False,
+    respect_blackout=False,
+)
+
+r.iter_event_groups(
+    start=None,
+    end=None,
+    handles=None,
+    decoded=False,
+    include_initial=False,
+    respect_blackout=False,
+)
+
+r.iter_selected_changes(
+    handles,
+    start=None,
+    end=None,
+    include_initial=False,
+    decoded=False,
+    respect_blackout=False,
+)
+
+r.snapshot_at(
+    time,
+    handles=None,
+    decoded=False,
+    respect_blackout=False,
+)
+```
+
+Intended split:
+
+- `FstReader`: signal/section/event access;
+- analyzer layer: conditions, comparisons, statistics, reporting;
+- wavecut/filter layer: signal selection, time-window slicing, output writing.
+
+### Metadata and attributes
+
+```python
+r.metadata_for_handle(handle)
+
+r.blackouts()
+r.is_dump_active_at(time)
+r.iter_blackout_intervals(start=None, end=None)
+
+r.attributes(decoded=False)
+r.attributes_for_handle(handle, decoded=False)
+r.attribute_payload(attr)
+r.attribute_report(decoded=True)
+r.attribute_report_text()
+r.iter_vcd_extension_lines()
+```
+
+Unknown/vendor attributes are preserved. The reader exposes raw bytes plus report-friendly views such as escaped ASCII, UTF-8/Latin-1 views, hex, and base64. It does not guess vendor-specific business semantics.
 
 ---
 
@@ -140,12 +392,12 @@ The writer output is intentionally conservative: gzip hierarchy plus zlib VCDATA
 
 | Area | Status | Notes |
 |---|---:|---|
-| FST header (`HDR`) | Supported | Includes version, date, timescale, timezero, file type, counts. |
+| FST header (`HDR`) | Supported | Version, date, timescale, timezero, file type, counts. |
 | Geometry (`GEOM`) | Supported | Used for frame layout when present. |
 | GEOM-less fallback | Supported | Signal width/type can be inferred from hierarchy for compatible files. |
 | Hierarchy (`HIER`) | Supported | gzip hierarchy blocks. |
 | LZ4 hierarchy (`HIER_LZ4`) | Supported | Pure-Python LZ4 block decompression. |
-| LZ4DUO hierarchy (`HIER_LZ4DUO`) | Supported | Common layout support; needs more external corpus testing. |
+| LZ4DUO hierarchy (`HIER_LZ4DUO`) | Supported | Common layout support; external corpus testing is still recommended. |
 | Whole-file wrapper (`ZWRAPPER`) | Supported | gzip/raw-deflate wrapper handling. |
 | Static VCDATA | Supported | Frame, time table, chain table, per-handle value iteration. |
 | Dynamic alias VCDATA | Supported | `VCDATA_DYN_ALIAS` and `VCDATA_DYN_ALIAS2` parsing paths are implemented. |
@@ -153,7 +405,8 @@ The writer output is intentionally conservative: gzip hierarchy plus zlib VCDATA
 | LZ4 packed chains | Supported | Pure-Python raw LZ4 block decompression. |
 | FastLZ packed chains | Supported | Pure-Python FastLZ decompression. |
 | Multi-section VCDATA | Supported | Section iteration and all-section iterators are available. |
-| Scalar and vector values | Supported | Raw and decoded accessors. |
+| Block/section random access | Supported | Section time index plus handle-level chain access. |
+| Scalar and vector values | Supported | Raw, decoded, and formatted accessors. |
 | String values (`GEN_STRING`) | Supported | Variable-length string payloads are exposed as bytes. |
 | Real values | Supported | Raw bytes and decoded Python float helpers. |
 | Aliases | Supported | One handle can map to multiple hierarchy names. |
@@ -219,17 +472,26 @@ For unknown or third-party attributes, the reader preserves and reports the payl
 
 ## Project layout
 
-```
-src/truepyfstlib/       FST library (pure Python, stdlib only)
-verify/                 Test suite with fixtures and golden cross-checks
-CHANGELOG.md            Per-version release details
+```text
+src/truepyfstlib/
+  common.py        FST enums, dataclasses, and shared structures
+  compression.py   pure-Python LZ4/FastLZ decompression helpers
+  reader.py        FST reader, metadata, random-access iterators, report APIs
+  varint.py        FST varint encoding/decoding
+  writer.py        conservative FST writer
+
+verify/
+  roundtrip.py        small reader/writer roundtrip checks
+  verify_reader.py    reader compatibility checks
+  verify_writer.py    writer checks; can use fst2vcd when available
+  verify_golden.py    golden fixture validation helper
 ```
 
 ---
 
 ## Tests
 
-Run the pure-Python checks:
+Run pure-Python checks:
 
 ```bash
 # Linux / macOS
@@ -241,7 +503,7 @@ PYTHONPATH=src python verify/verify_writer.py
 $env:PYTHONPATH = "src"; python verify/roundtrip.py; python verify/verify_reader.py; python verify/verify_writer.py
 ```
 
-Golden fixture cross-validation (requires GTKWave `fst2vcd`):
+Golden fixture cross-validation, if available:
 
 ```bash
 PYTHONPATH=src python verify/verify_golden.py

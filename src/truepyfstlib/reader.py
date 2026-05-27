@@ -42,7 +42,7 @@ from .common import (
     FST_ST_GEN_ATTRBEGIN, FST_ST_GEN_ATTREND,
     FST_ST_VCD_SCOPE, FST_ST_VCD_UPSCOPE, FST_VT_MAX,
     FST_HDR_SIM_VERSION_SIZE, FST_HDR_DATE_SIZE, FST_DOUBLE_ENDTEST,
-    FST_RCV_STR, FstVarType, FstAttrType, FstMiscType,
+    FST_RCV_STR, FstVarType, FstVarDir, FstAttrType, FstMiscType,
 )
 from .varint import (
     read_varint, read_varint32, read_varint64,
@@ -922,6 +922,148 @@ class FstReader:
             return bytes(value)
         return bytes(value).decode("ascii", errors="replace")
 
+    # ------------------------------------------------------------------
+    # Stable file/structure information API
+    # ------------------------------------------------------------------
+
+    def get_version_string(self) -> str:
+        """Return the simulator/writer version string from the FST header."""
+        return self.header.version
+
+    def get_date_string(self) -> str:
+        """Return the date string from the FST header."""
+        return self.header.date
+
+    def get_file_type(self) -> int:
+        """Return the libfst file type code from the FST header."""
+        return int(self.header.filetype)
+
+    def get_var_count(self) -> int:
+        """Return the variable count reported by the FST header."""
+        return int(self.header.var_count)
+
+    def get_scope_count(self) -> int:
+        """Return the scope count reported by the FST header."""
+        return int(self.header.scope_count)
+
+    def get_alias_count(self) -> int:
+        """Return the number of alias variable declarations parsed from hierarchy."""
+        return sum(1 for v in self.vars() if v.is_alias)
+
+    def get_start_time(self) -> int:
+        """Return the FST start time tick from the header."""
+        return int(self.header.start_time)
+
+    def get_end_time(self) -> int:
+        """Return the FST end time tick from the header."""
+        return int(self.header.end_time)
+
+    def get_timescale(self) -> int:
+        """Return the FST timescale exponent from the header."""
+        return int(self.header.timescale)
+
+    def get_timezero(self) -> int:
+        """Return the signed FST timezero offset from the header."""
+        return int(self.header.timezero)
+
+    def get_value_change_section_count(self) -> int:
+        """Return the value-change section count reported by the header."""
+        return int(self.header.value_change_section_count)
+
+    def get_max_handle(self) -> int:
+        """Return the maximum canonical handle reported by the header."""
+        return int(self.header.max_handle)
+
+    def get_value_from_handle_at_time(
+        self, handle: int | str, time: int, *, decoded: bool = False,
+        respect_blackout: bool = False,
+    ):
+        """libfst-style wrapper around ``get_value_at()``."""
+        return self.get_value_at(handle, time, decoded=decoded, respect_blackout=respect_blackout)
+
+    def file_info(self) -> dict:
+        """Return a stable, external-facing file overview.
+
+        This replaces the old internal ``summary()`` helper.  The schema is
+        intentionally compact and suitable for analyzer/list/info commands.
+        """
+        block_counts: dict[str, int] = {}
+        for b in self._blocks:
+            name = _enum_name(FstBlockType, b.block_type) or str(int(b.block_type))
+            block_counts[name] = block_counts.get(name, 0) + 1
+        try:
+            size_bytes = self.path.stat().st_size
+        except OSError:
+            size_bytes = None
+        return {
+            "file": str(self.path),
+            "size_bytes": size_bytes,
+            "version": self.header.version,
+            "date": self.header.date,
+            "filetype": int(self.header.filetype),
+            "filetype_name": _file_type_name(self.header.filetype),
+            "timescale": int(self.header.timescale),
+            "timezero": int(self.header.timezero),
+            "start_time": int(self.header.start_time),
+            "end_time": int(self.header.end_time),
+            "var_count": int(self.header.var_count),
+            "scope_count": int(self.header.scope_count),
+            "alias_count": self.get_alias_count(),
+            "max_handle": int(self.header.max_handle),
+            "value_change_section_count": int(self.header.value_change_section_count),
+            "parsed_value_change_section_count": len(self._vc_sections),
+            "block_count": len(self._blocks),
+            "block_types": block_counts,
+            "blackout_count": len(self._blackouts),
+            "comment_count": len(self._comments),
+            "env_var_count": len(self._env_vars),
+            "attribute_count": len(self._attribute_events),
+            "mmap_backed": self._mmap is not None,
+        }
+
+    def block_table(self) -> list[dict]:
+        """Return top-level FST block directory records."""
+        return [
+            {
+                "index": i,
+                "offset": int(b.offset),
+                "block_type": int(b.block_type),
+                "block_type_name": _enum_name(FstBlockType, b.block_type),
+                "section_length": int(b.section_length),
+                "payload_length": max(0, int(b.section_length) - 8),
+            }
+            for i, b in enumerate(self._blocks)
+        ]
+
+    def section_table(self) -> list[dict]:
+        """Return parsed VCDATA section directory records."""
+        return [
+            {
+                "index": i,
+                "block_offset": int(s.block_offset),
+                "block_type": int(s.block_type),
+                "block_type_name": _enum_name(FstBlockType, s.block_type),
+                "section_length": int(s.section_length),
+                "begin_time": int(s.beg_time),
+                "end_time": int(s.end_time),
+                "time_count": len(s.times or []),
+                "frame_uncompressed_length": int(s.frame_uclen),
+                "frame_compressed_length": int(s.frame_clen),
+                "frame_max_handle": int(s.frame_maxhandle),
+                "vc_max_handle": int(s.vc_maxhandle),
+                "pack_type": s.pack_type,
+                "chain_count": len(s.chain_table or []),
+            }
+            for i, s in enumerate(self._vc_sections)
+        ]
+
+    def signal_table(self, *, include_aliases: bool = True) -> list[dict]:
+        """Return one structured signal record per canonical handle."""
+        return [
+            self._signal_record(h, include_aliases=include_aliases)
+            for h in sorted(self._handle_to_var)
+        ]
+
     def signal_names(self, *, include_aliases: bool = True) -> list[str]:
         """Return full signal names known to the hierarchy index."""
         if include_aliases:
@@ -972,10 +1114,85 @@ class FstReader:
             return sorted(set(int(h) for h in out))
         return [int(h) for h in out]
 
+    def resolve_handle(
+        self, query: int | str, *, regex: bool = False, include_aliases: bool = True
+    ) -> int:
+        """Resolve ``query`` to exactly one handle.
+
+        This is the strict, script-friendly resolver.  Integer handles are
+        returned unchanged.  String queries try exact full-name lookup first;
+        if no exact match exists, wildcard or regex matching is used.  A
+        missing query raises ``KeyError`` and an ambiguous query raises
+        ``ValueError``.  CLI-style substring filtering is intentionally left to
+        analyzer layers.
+        """
+        if not isinstance(query, str):
+            return int(query)
+        try:
+            return self.find_handle(query, include_aliases=include_aliases)
+        except KeyError:
+            pass
+        handles = self.find_handles(
+            query, regex=regex, include_aliases=include_aliases, unique=True
+        )
+        if not handles:
+            raise KeyError(f"unknown signal pattern: {query}")
+        if len(handles) != 1:
+            examples = []
+            for h in handles[:5]:
+                names = self.names_for_handle(h)
+                examples.append(names[0] if names else str(h))
+            raise ValueError(
+                f"signal pattern {query!r} matches {len(handles)} handles"
+                + (f": {', '.join(examples)}" if examples else "")
+            )
+        return int(handles[0])
+
     def _resolve_handle(self, handle_or_name: int | str) -> int:
-        if isinstance(handle_or_name, str):
-            return self.find_handle(handle_or_name)
-        return int(handle_or_name)
+        return self.resolve_handle(handle_or_name)
+
+    def _signal_record(self, handle: int, *, include_aliases: bool = True) -> dict:
+        h = int(handle)
+        var = self._handle_to_var.get(h)
+        names = self.names_for_handle(h)
+        canonical = var.full_name if var is not None else (names[0] if names else "")
+        width = self._signal_lengths[h - 1] if 0 < h <= len(self._signal_lengths) else None
+        sig_type = self._signal_types[h - 1] if 0 < h <= len(self._signal_types) else (var.var_type if var else None)
+        rec = {
+            "handle": h,
+            "name": canonical,
+            "path": canonical,
+            "width": width,
+            "type": sig_type,
+            "type_name": _enum_name(FstVarType, sig_type),
+            "direction": var.direction if var is not None else None,
+            "direction_name": _enum_name(FstVarDir, var.direction) if var is not None else "",
+            "is_string": self.is_string_handle(h),
+            "is_real": self.is_real_handle(h),
+            "metadata": _metadata_summary(self.metadata_for_handle(h)),
+        }
+        if include_aliases:
+            rec["aliases"] = names
+        return rec
+
+    def find_signal(self, name: str, *, include_aliases: bool = True) -> dict:
+        """Return the signal record for an exact full signal name."""
+        return self._signal_record(self.find_handle(name, include_aliases=include_aliases), include_aliases=include_aliases)
+
+    def find_signals(
+        self, pattern: str | None = None, *, regex: bool = False,
+        include_aliases: bool = True, unique: bool = True,
+    ) -> list[dict]:
+        """Return signal records matching ``pattern``.
+
+        This is the structured counterpart of ``find_handles()``.  Matching is
+        exact-all when ``pattern`` is ``None``, regex when ``regex=True``, and
+        shell-style wildcard otherwise.
+        """
+        return [
+            self._signal_record(h, include_aliases=include_aliases)
+            for h in self.find_handles(pattern, regex=regex, include_aliases=include_aliases, unique=unique)
+        ]
 
     def sections_overlapping(self, start: int | None = None, end: int | None = None) -> list[int]:
         """Return VCDATA section indexes whose time range overlaps [start, end].
@@ -1014,6 +1231,10 @@ class FstReader:
         if idx >= len(self._vc_sections):
             return len(self._vc_sections) - 1
         return idx
+
+    def section_at_time(self, time: int) -> int | None:
+        """Alias for ``section_for_time()`` with a more direct name."""
+        return self.section_for_time(time)
 
     def get_value_at(
         self, handle: int | str, time: int, *, decoded: bool = False,
@@ -1120,6 +1341,94 @@ class FstReader:
             for item in pending_next:
                 heapq.heappush(heap, item)
             yield t, changes
+
+    def iter_events(
+        self, start: int | None = None, end: int | None = None,
+        handles: list[int | str] | tuple[int | str, ...] | None = None,
+        *, decoded: bool = False, include_initial: bool = False,
+        respect_blackout: bool = False,
+    ) -> Iterator[tuple[int, int, object]]:
+        """Yield a flat selected event stream: ``(time, handle, value)``.
+
+        This is the FST counterpart to a VCD parser's selected event iterator.
+        It is a thin wrapper over ``iter_selected_changes()`` and decodes only
+        requested handles.  ``handles=None`` means all canonical handles.
+        """
+        if handles is None:
+            handles = sorted(self._handle_to_var)
+        for t, changes in self.iter_selected_changes(
+            handles, start=start, end=end, include_initial=include_initial,
+            decoded=decoded, respect_blackout=respect_blackout,
+        ):
+            for h, value in changes:
+                yield t, h, value
+
+    def iter_event_groups(
+        self, start: int | None = None, end: int | None = None,
+        handles: list[int | str] | tuple[int | str, ...] | None = None,
+        *, decoded: bool = False, include_initial: bool = False,
+        respect_blackout: bool = False,
+    ) -> Iterator[tuple[int, list[tuple[int, object]]]]:
+        """Yield selected changes grouped by timestamp.
+
+        This is the script-friendly name for ``iter_selected_changes()``.
+        ``handles=None`` means all canonical handles.
+        """
+        if handles is None:
+            handles = sorted(self._handle_to_var)
+        yield from self.iter_selected_changes(
+            handles, start=start, end=end, include_initial=include_initial,
+            decoded=decoded, respect_blackout=respect_blackout,
+        )
+
+    def snapshot_at(
+        self, time: int, handles: list[int | str] | tuple[int | str, ...] | None = None,
+        *, decoded: bool = False, respect_blackout: bool = False,
+    ) -> dict[int, object]:
+        """Return selected signal values at ``time``.
+
+        The implementation uses section frames and per-handle chains; it does
+        not materialize a full-file event stream.  ``handles=None`` returns all
+        canonical handles, which can be expensive for very large files.
+        """
+        if handles is None:
+            resolved = sorted(self._handle_to_var)
+        else:
+            resolved = [self._resolve_handle(h) for h in handles]
+        return {
+            h: self.get_value_at(h, time, decoded=decoded, respect_blackout=respect_blackout)
+            for h in resolved
+        }
+
+    def format_value(self, handle: int | str, value) -> str:
+        """Return a human-readable representation for a raw or decoded value."""
+        h = self._resolve_handle(handle)
+        if value is None:
+            return "(inactive)"
+        if isinstance(value, bytes):
+            if self.is_real_handle(h):
+                return repr(self.decode_value(h, value))
+            if self.is_string_handle(h):
+                try:
+                    return value.decode("utf-8")
+                except UnicodeDecodeError:
+                    return value.hex()
+            text = value.decode("ascii", errors="replace")
+        else:
+            if isinstance(value, float):
+                return repr(value)
+            text = str(value)
+        width = self._signal_lengths[h - 1] if 0 < h <= len(self._signal_lengths) else 0
+        if width <= 1:
+            return text
+        if any(ch in text.lower() for ch in ("x", "z")):
+            return "b" + text
+        try:
+            intval = int(text, 2)
+        except ValueError:
+            return text
+        hex_width = max(1, (int(width) + 3) // 4)
+        return f"{intval} (0x{intval:0{hex_width}x})"
 
     # More explicit alias for callers that prefer value-oriented naming.
     iter_selected_value_changes = iter_selected_changes
@@ -1448,17 +1757,6 @@ class FstReader:
         for idx in range(len(self._vc_sections)):
             yield from self.iter_time_value_pairs(idx, respect_blackout=respect_blackout)
 
-    def summary(self) -> dict:
-        return {
-            "path": str(self.path),
-            "header": self.header,
-            "blocks": [(b.offset, b.block_type, b.section_length) for b in self._blocks],
-            "scope_count_parsed": len(self.scopes()),
-            "var_count_parsed": len(self.vars()),
-            "vc_section_count": len(self._vc_sections),
-            "signal_lengths": self._signal_lengths,
-        }
-
 
 class _ByteView:
     """Lightweight non-owning slice over bytes/mmap data.
@@ -1505,6 +1803,24 @@ def _u64be(buf: bytes, off: int = 0) -> int:
 
 def _i8(byte: int) -> int:
     return byte - 256 if byte >= 128 else byte
+
+
+def _enum_name(enum_cls, value) -> str:
+    """Best-effort IntEnum name lookup for external tables."""
+    if value is None:
+        return ""
+    try:
+        return enum_cls(int(value)).name.lower()
+    except Exception:
+        return f"unknown_{int(value)}" if isinstance(value, int) else "unknown"
+
+
+def _file_type_name(value) -> str:
+    mapping = {0: "verilog", 1: "vhdl", 2: "verilog_vhdl"}
+    try:
+        return mapping.get(int(value), f"unknown_{int(value)}")
+    except Exception:
+        return "unknown"
 
 
 def _read_cstr(buf: bytes | bytearray | memoryview, off: int) -> tuple[str, int]:
@@ -1809,6 +2125,26 @@ def _format_attr_as_vcd_extension(attr: FstAttrBegin) -> Iterator[str]:
             yield f"$attrbegin misc {subtype:02x} {int(sidx)} {int(attr.arg)} $end"
         else:
             yield f"$attrbegin misc {subtype:02x} {name} {int(attr.arg)} $end"
+
+def _metadata_summary(meta: FstSignalMetadata | None) -> dict:
+    """Return a JSON-friendly metadata summary for signal_table()."""
+    if meta is None:
+        return {}
+    return {
+        "type_name": meta.type_name,
+        "supplemental_var_type": int(meta.supplemental_var_type),
+        "supplemental_data_type": int(meta.supplemental_data_type),
+        "value_list": meta.value_list,
+        "enum_table_handle": int(meta.enum_table_handle),
+        "source_stem": meta.source_stem,
+        "source_instantiation_stem": meta.source_instantiation_stem,
+        "attribute_count": len(meta.all_attributes),
+        "misc_attribute_count": len(meta.misc_attributes),
+        "array_attribute_count": len(meta.array_attributes),
+        "enum_attribute_count": len(meta.enum_attributes),
+        "pack_attribute_count": len(meta.pack_attributes),
+    }
+
 
 def _metadata_replace(meta: FstSignalMetadata, **kwargs) -> FstSignalMetadata:
     data = {

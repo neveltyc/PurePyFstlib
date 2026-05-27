@@ -98,6 +98,7 @@ class FstReader:
         self._parse_geometry_and_hierarchy()
         self._build_handle_map()
         self._parse_vc_sections()
+        self._parse_blackouts()
 
     @staticmethod
     def _scan_blocks(data: bytes) -> list[FstBlock]:
@@ -364,6 +365,8 @@ class FstReader:
             tpval += val
             times.append(tpval)
             off += used
+        # Build O(1) lookup for cumulative time indices
+        self._time_to_index: dict[int, int] = {t: i for i, t in enumerate(times)}
         return times
 
     def _parse_chain_table(self, sect: VcSection, payload: bytes) -> None:
@@ -449,6 +452,35 @@ class FstReader:
                     chain_table_lengths[i] = chain_table_lengths[v]
         sect.chain_table = chain_table[:idx]
         sect.chain_table_lengths = chain_table_lengths[:idx]
+
+    def _parse_blackouts(self) -> None:
+        self._blackouts: list[tuple[int, bool]] = []
+        for b in self._blocks:
+            if b.block_type == FST_BL_BLACKOUT:
+                p = b.payload
+                if len(p) < 2:
+                    continue
+                num, used = read_varint(p, 0)
+                off = used
+                cur_time = 0
+                for _ in range(num):
+                    if off >= len(p):
+                        break
+                    active = p[off] != 0
+                    off += 1
+                    delta, used2 = read_varint64(p, off)
+                    off += used2
+                    cur_time += delta
+                    self._blackouts.append((cur_time, active))
+
+    @property
+    def blackouts(self) -> list[tuple[int, bool]]:
+        """Blackout intervals (time, is_active).
+        
+        Each entry records a dump-active state change at the given time.
+        Use this to filter value changes during inactive periods.
+        """
+        return list(self._blackouts)
 
     @property
     def num_handles(self) -> int:

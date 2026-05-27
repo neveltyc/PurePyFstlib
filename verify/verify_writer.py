@@ -251,6 +251,27 @@ def test_empty_file_has_vc_section():
     Path(path).unlink()
 
 
+def test_blackout_reader_exposes_intervals():
+    """Reader should expose blackout intervals from writer."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s")
+    w.set_upscope()
+    w.emit_dump_active(False)
+    w.emit_time_change(100)
+    w.emit_dump_active(True)
+    w.emit_time_change(100)
+    w.emit_value_change(h, b"1")
+    w.close()
+    r = FstReader(path)
+    assert len(r.blackouts) == 2
+    assert r.blackouts[0] == (0, False)
+    assert r.blackouts[1] == (100, True)
+    Path(path).unlink()
+
+
 def main():
     tests = [
         test_minimal, test_sparse, test_string_var, test_alias,
@@ -263,6 +284,7 @@ def main():
         test_gen_string_auto_detect,
         test_attr_rejects_negative_type,
         test_empty_file_has_vc_section,
+        test_blackout_reader_exposes_intervals,
     ]
     for t in tests:
         t()

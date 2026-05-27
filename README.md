@@ -53,11 +53,13 @@ large VCD/FST
 
 ## Install
 
-From a local checkout:
-
 ```bash
+git clone https://github.com/neveltyc/PurePyFstlib.git
+cd PurePyFstlib
 pip install -e .
 ```
+
+Alternatively build a wheel:
 
 Build a wheel:
 
@@ -70,6 +72,8 @@ The package is pure Python and requires no C compiler for normal installation.
 ---
 
 ## Quick start
+
+Read waveform files and inspect signals, metadata, and value changes.
 
 ```python
 from truepyfstlib import FstReader

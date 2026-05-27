@@ -73,6 +73,8 @@ python -m pip wheel . -w dist
 
 ## 快速开始
 
+读取波形文件，查看信号、元数据和值变化。
+
 ### 读取 FST 文件
 
 ```python

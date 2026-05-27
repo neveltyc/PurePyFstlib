@@ -138,8 +138,11 @@ class FstWriter:
             self._end_time = time
 
     def emit_value_change(self, handle: int, value: bytes) -> None:
+        vi = self._vars.get(handle)
+        is_string = bool(vi and vi.is_string)
         self._vc_records.append(_VcRecord(
             time_delta=self._current_time, handle=handle, value=value,
+            is_string=is_string,
         ))
 
     def emit_value_change_bit(self, handle: int, bit: int) -> None:

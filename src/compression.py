@@ -84,76 +84,68 @@ def lz4_decompress(src: bytes, expected_len: int | None = None) -> bytes:
 def fastlz_decompress(src: bytes, maxout: int) -> bytes:
     """Pure-Python FastLZ level 1 decompressor.
 
-    FastLZ is one of the compression algorithms used in FST VCDATA blocks.
-    This is a direct port of fastlz_decompress() from fastlz.c.
+    Direct port of fastlz1_decompress() from fastlz.c:418-547 (level-1
+    branches only; level-2 is not used by libfst). FastLZ is one of the
+    compression options for FST VCDATA chunks (pack_type 'F').
+
+    Format (level 1):
+      byte 0: low 5 bits = first ctrl; high 3 bits = level marker (discard).
+      Thereafter, each ctrl byte branches:
+        ctrl >= 32  back-reference.  length = (ctrl>>5)-1 + 3 bytes.
+                    offset = ((ctrl & 31) << 8) | next_byte.
+                    Copy from out[op - offset - 1] byte-by-byte
+                    (overlap-safe; do NOT use a slice).
+        ctrl <  32  literal: copy next (ctrl + 1) bytes verbatim.
+      After each event, read the next full byte as ctrl.  Exit when
+      input is exhausted.
     """
+    if not src:
+        return b""
+    out = bytearray()
     ip = 0
     ip_limit = len(src)
-    ip_bound = ip_limit - 2
-    op = 0
-    op_limit = maxout
-    out = bytearray(maxout)
-
-    while True:
-        # Process literal run
-        ctrl = src[ip] & 31
-        ip += 1
-        if ctrl < 32:
-            ctrl += 1
-            if ctrl >= 32:
-                while True:
-                    if ip >= ip_limit:
-                        raise FstFormatError("truncated FastLZ literal")
-                    b = src[ip]
-                    ip += 1
-                    ctrl += b
-                    if b != 255:
-                        break
-            if op + ctrl > op_limit:
-                raise FstFormatError("FastLZ output overflow on literal")
-            if ip + ctrl > ip_limit:
-                raise FstFormatError("truncated FastLZ literal payload")
-            out[op:op + ctrl] = src[ip:ip + ctrl]
-            ip += ctrl
-            op += ctrl
-
-        if ip >= ip_bound:
-            break
-
-        # Process back-reference
-        ofs = src[ip] | (src[ip + 1] << 8)
-        ip += 2
-
-        if ofs == 0:
-            break
-
-        ref = op - ofs
-        if ref < 0:
-            raise FstFormatError(f"invalid FastLZ offset {ofs}")
-
-        # Match length
-        ctrl = src[ip - 2] >> 5
-        if ctrl == 7:
-            ctrl += 1
-            while True:
+    ctrl = src[ip] & 0x1F
+    ip += 1
+    loop = True
+    while loop:
+        if ctrl >= 32:
+            length = (ctrl >> 5) - 1
+            ofs = (ctrl & 0x1F) << 8
+            if length == 6:
                 if ip >= ip_limit:
-                    raise FstFormatError("truncated FastLZ match length")
-                b = src[ip]
+                    raise FstFormatError("truncated FastLZ extended length")
+                length += src[ip]
                 ip += 1
-                ctrl += b
-                if b != 255:
-                    break
-
-        ctrl += 2
-
-        if op + ctrl > op_limit:
-            ctrl = op_limit - op
-        for _ in range(ctrl):
-            out[op] = out[ref]
-            op += 1
-            ref += 1
-
-    return bytes(out[:op])
+            if ip >= ip_limit:
+                raise FstFormatError("truncated FastLZ offset low byte")
+            ref = len(out) - ofs - src[ip] - 1
+            ip += 1
+            if ref < 0:
+                raise FstFormatError(
+                    f"invalid FastLZ back-reference (ref={ref})"
+                )
+            if ip < ip_limit:
+                ctrl = src[ip]
+                ip += 1
+            else:
+                loop = False
+            for _ in range(length + 3):
+                out.append(out[ref])
+                ref += 1
+        else:
+            count = ctrl + 1
+            if ip + count > ip_limit:
+                raise FstFormatError("truncated FastLZ literal payload")
+            out.extend(src[ip:ip + count])
+            ip += count
+            if ip < ip_limit:
+                ctrl = src[ip]
+                ip += 1
+            else:
+                loop = False
+    if maxout > 0 and len(out) > maxout:
+        return bytes(out[:maxout])
+    return bytes(out)
 
 
 def decompress_zlib(data: bytes, expected_len: int | None = None) -> bytes:

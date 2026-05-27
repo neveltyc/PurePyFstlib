@@ -525,9 +525,21 @@ class FstReader:
         while off < n:
             vli, skiplen = read_varint(vc_data, off)
             off += skiplen
-            if sig_len <= 1:
-                if sig_len == 0:
+            if sig_len == 0:
+                # variable-length string: (tdelta, length, bytes)
+                if vli & 1:
+                    break  # unknown encoding
+                tidx += vli >> 1
+                length, lskip = read_varint(vc_data, off)
+                off += lskip
+                val = bytes(vc_data[off:off + length])
+                off += length
+                if tidx >= len(times):
                     break
+                yield (times[tidx], val)
+                continue
+            if sig_len <= 1:
+                # Single-bit: value encoded in vli
                 if not (vli & 1):
                     shamt = 2 << (vli & 1)
                     tidx += vli >> shamt
@@ -628,10 +640,29 @@ class FstReader:
                 sig_len = sig_lens[idx]
                 if sig_len <= 1:
                     if sig_len == 0:
-                        headptr[idx] += skiplen
-                        length_remaining[idx] -= skiplen
-                        tc_head[ti] = scatterptr[idx]
-                        scatterptr[idx] = 0
+                        # variable-length string
+                        if not (vli & 1):
+                            strlen, lskip2 = read_varint32(traversal_buf, headptr[idx] + skiplen)
+                            raw_val = bytes(traversal_buf[headptr[idx] + skiplen + lskip2:headptr[idx] + skiplen + lskip2 + strlen])
+                            val = raw_val
+                            consume = skiplen + lskip2 + strlen
+                            headptr[idx] += consume
+                            length_remaining[idx] -= consume
+                            tc_head[ti] = scatterptr[idx]
+                            scatterptr[idx] = 0
+                            if length_remaining[idx]:
+                                nv = peek_varint32(traversal_buf, headptr[idx])
+                                tdelta = nv >> 1
+                                next_ti = ti + tdelta
+                                if next_ti < len(times):
+                                    scatterptr[idx] = tc_head[next_ti]
+                                    tc_head[next_ti] = idx + 1
+                            changes.append((idx + 1, val))
+                        else:
+                            headptr[idx] += skiplen
+                            length_remaining[idx] -= skiplen
+                            tc_head[ti] = scatterptr[idx]
+                            scatterptr[idx] = 0
                         continue
                     if not (vli & 1):
                         val_byte = ((vli >> 1) & 1) | 0x30

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+Reader enhancements:
+
+- GEOM-less file compatibility: derive signal lengths/types from hierarchy
+  when geometry block is missing (matches libfst fallback behavior)
+- FST_BL_SKIP end marker: _scan_blocks stops at 0xff instead of requiring
+  full 9-byte block header
+- Empty/frame-only VCDATA sections: iter_time_value_pairs handles sections
+  with no value changes, returning frame snapshot at beg_time
+- Real value decoding: decode_value returns Python float for real handles
+  using header endian marker; fixed-width signals return ASCII string;
+  string signals return raw bytes
+- New decode APIs: get_initial_value_decoded, iter_decoded_value_changes,
+  iter_decoded_value_changes_all
+- Cross-section aggregation: iter_value_changes_all with include_initial
+  flag; iter_time_value_pairs_all
+- Chain scheduling boundary protection: tdelta/remaining guards
+  prevent index errors on malformed or empty chain data
+- New test file: verify/verify_reader.py (4 tests)
+
+
 ## 0.1.0
 
 Writer fully aligned with libfst C API:

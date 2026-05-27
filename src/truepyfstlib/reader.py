@@ -34,7 +34,7 @@ from .common import (
     FST_ST_GEN_ATTRBEGIN, FST_ST_GEN_ATTREND,
     FST_ST_VCD_SCOPE, FST_ST_VCD_UPSCOPE, FST_VT_MAX,
     FST_HDR_SIM_VERSION_SIZE, FST_HDR_DATE_SIZE, FST_DOUBLE_ENDTEST,
-    FST_RCV_STR,
+    FST_RCV_STR, FstVarType,
 )
 from .varint import (
     read_varint, read_varint32, read_varint64,
@@ -69,6 +69,12 @@ class FstReader:
     """Pure-Python reader for FST waveform files."""
 
     VCDATA_BLOCK_TYPES = {FST_BL_VCDATA, FST_BL_VCDATA_DYN_ALIAS, FST_BL_VCDATA_DYN_ALIAS2}
+    REAL_VAR_TYPES = {
+        FstVarType.VCD_REAL,
+        FstVarType.VCD_REAL_PARAMETER,
+        FstVarType.VCD_REALTIME,
+        FstVarType.SV_SHORTREAL,
+    }
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -102,13 +108,21 @@ class FstReader:
 
     @staticmethod
     def _scan_blocks(data: bytes) -> list[FstBlock]:
+        """Scan top-level FST blocks.
+
+        libfst treats FST_BL_SKIP as an end marker.  Some files contain only a
+        single trailing 0xff byte, so do not require a full 9-byte section
+        header once the marker is seen.
+        """
         blocks: list[FstBlock] = []
         off = 0
         n = len(data)
         while off < n:
+            block_type = data[off]
+            if block_type == FST_BL_SKIP:
+                break
             if off + 9 > n:
                 raise FstFormatError(f"truncated block header at offset {off}")
-            block_type = data[off]
             section_length = _u64be(data, off + 1)
             end = off + 1 + section_length
             if section_length < 8 or end > n:
@@ -191,6 +205,7 @@ class FstReader:
 
     def _extract_hierarchy(self) -> bytes:
         geom_blocks = [b for b in self._blocks if b.block_type == FST_BL_GEOM]
+        self._has_geometry = bool(geom_blocks)
         if geom_blocks:
             self._signal_lengths, self._signal_types = \
                 self._parse_geometry(geom_blocks[0])
@@ -281,10 +296,52 @@ class FstReader:
     def _parse_geometry_and_hierarchy(self) -> None:
         hier_data = self._extract_hierarchy()
         self._hierarchy_events = self._parse_hierarchy(hier_data)
-        # Precompute frame data prefix offsets for O(1) get_initial_value
+        self._patch_signal_info_from_hierarchy()
+        self._build_frame_prefix()
+
+    def _patch_signal_info_from_hierarchy(self) -> None:
+        """Fill or refine signal length/type arrays from hierarchy records.
+
+        GEOM is authoritative for frame sizes when present, but it deliberately
+        collapses most non-real types to "wire".  The hierarchy stream carries
+        the real var_type, and older or utility-generated FSTs may omit GEOM.
+        Mirror libfst's fallback: derive canonical handle lengths/types from
+        hierarchy whenever GEOM is missing or incomplete, and use hierarchy to
+        refine signal_types without changing GEOM-derived sizes.
+        """
+        max_handle = int(self.header.max_handle)
+        if len(self._signal_lengths) < max_handle:
+            self._signal_lengths.extend([1] * (max_handle - len(self._signal_lengths)))
+        if len(self._signal_types) < max_handle:
+            self._signal_types.extend([int(FstVarType.VCD_WIRE)] * (max_handle - len(self._signal_types)))
+
+        for e in self._hierarchy_events:
+            if not isinstance(e, FstVar) or e.is_alias:
+                continue
+            idx = e.handle - 1
+            if idx < 0:
+                continue
+            while idx >= len(self._signal_lengths):
+                self._signal_lengths.append(1)
+                self._signal_types.append(int(FstVarType.VCD_WIRE))
+            vt = int(e.var_type)
+            self._signal_types[idx] = int(FstVarType.VCD_REAL) if vt in self.REAL_VAR_TYPES else vt
+            # If GEOM was absent, derive the frame width from HIER.  If GEOM
+            # exists, keep its frame sizes because they are the layout source
+            # for VCDATA frame_data.
+            if not getattr(self, "_has_geometry", False):
+                if vt in self.REAL_VAR_TYPES:
+                    self._signal_lengths[idx] = 8
+                elif vt == int(FstVarType.GEN_STRING):
+                    self._signal_lengths[idx] = 0
+                else:
+                    self._signal_lengths[idx] = int(e.length)
+
+    def _build_frame_prefix(self) -> None:
+        # Precompute frame data prefix offsets for O(1) get_initial_value.
         self._frame_prefix: list[int] = [0]
         for sl in self._signal_lengths:
-            self._frame_prefix.append(self._frame_prefix[-1] + sl)
+            self._frame_prefix.append(self._frame_prefix[-1] + max(0, int(sl)))
 
     def _build_handle_map(self) -> None:
         """Build handle->FstVar lookup dict.
@@ -494,6 +551,64 @@ class FstReader:
     def signal_types(self) -> list[int]:
         return self._signal_types
 
+    def is_string_handle(self, handle: int) -> bool:
+        idx = handle - 1
+        if idx < 0 or idx >= len(self._signal_lengths):
+            return False
+        return self._signal_lengths[idx] == 0
+
+    def is_real_handle(self, handle: int) -> bool:
+        idx = handle - 1
+        if idx < 0 or idx >= len(self._signal_types):
+            return False
+        return self._signal_types[idx] == int(FstVarType.VCD_REAL)
+
+    def decode_value(self, handle: int, value: bytes):
+        """Decode a raw FST value into a convenient Python value.
+
+        Fixed-width scalar/vector values are returned as ASCII strings.
+        GEN_STRING values remain bytes so binary payloads are preserved.
+        Real values are returned as Python float using the file's double
+        endian marker, matching libfst's callback conversion mode.
+        """
+        if self.is_real_handle(handle):
+            if len(value) < 8:
+                raise FstFormatError(f"real value for handle {handle} is shorter than 8 bytes")
+            fmt = "<d" if self.header.double_endian_match else ">d"
+            return struct.unpack(fmt, value[:8])[0]
+        if self.is_string_handle(handle):
+            return bytes(value)
+        return bytes(value).decode("ascii", errors="replace")
+
+    def get_initial_value_decoded(self, handle: int, section_index: int = 0):
+        return self.decode_value(handle, self.get_initial_value(handle, section_index))
+
+    def iter_decoded_value_changes(
+        self, handle: int, section_index: int = 0,
+    ) -> Iterator[tuple[int, object]]:
+        for t, v in self.iter_value_changes(handle, section_index):
+            yield t, self.decode_value(handle, v)
+
+    def iter_value_changes_all(
+        self, handle: int, *, include_initial: bool = False,
+    ) -> Iterator[tuple[int, bytes]]:
+        """Iterate a handle's value changes across all VCDATA sections.
+
+        include_initial=True emits each section's frame value before that
+        section's explicit changes.  This is useful for waveform slicing,
+        where a time-window boundary needs a correct starting snapshot.
+        """
+        for section_index, sect in enumerate(self._vc_sections):
+            if include_initial:
+                yield sect.beg_time, self.get_initial_value(handle, section_index)
+            yield from self.iter_value_changes(handle, section_index)
+
+    def iter_decoded_value_changes_all(
+        self, handle: int, *, include_initial: bool = False,
+    ) -> Iterator[tuple[int, object]]:
+        for t, v in self.iter_value_changes_all(handle, include_initial=include_initial):
+            yield t, self.decode_value(handle, v)
+
     def vars(self) -> list[FstVar]:
         return [e for e in self._hierarchy_events if isinstance(e, FstVar)]
 
@@ -621,17 +736,36 @@ class FstReader:
     def iter_time_value_pairs(
         self, section_index: int = 0,
     ) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
+        """Yield time-ordered changes for one VCDATA section.
+
+        Empty frame-only sections are valid FST and yield the section snapshot
+        at beg_time.  Dynamic-alias chain-table entries are already resolved in
+        _parse_chain_table, matching libfst's chain reuse behavior.
+        """
         if section_index >= len(self._vc_sections):
             return
         sect = self._vc_sections[section_index]
-        times = sect.times
+        times = sect.times or []
         max_handle = self.header.max_handle
         sig_lens = list(self._signal_lengths)
         sig_typs = list(self._signal_types)
         while len(sig_lens) < max_handle:
             sig_lens.append(1)
         while len(sig_typs) < max_handle:
-            sig_typs.append(16)
+            sig_typs.append(int(FstVarType.VCD_WIRE))
+
+        initial_vals: list[tuple[int, bytes]] = []
+        frame_off = 0
+        for idx in range(max_handle):
+            sl = max(0, sig_lens[idx])
+            initial_vals.append((idx + 1, sect.frame_data[frame_off:frame_off + sl]))
+            frame_off += sl
+
+        if not times:
+            if initial_vals:
+                yield (sect.beg_time, initial_vals)
+            return
+
         tc_head: list[int] = [0] * len(times)
         scatterptr: list[int] = [0] * max_handle
         headptr: list[int] = [0] * max_handle
@@ -653,15 +787,14 @@ class FstReader:
                 continue
             dest_len = first_val
             if first_val:
-                comp_data = raw_compressed[skiplen:skiplen + chain_len - skiplen]
+                comp_data = raw_compressed[skiplen:]
                 from .compression import decompress_block
-                try:
-                    decompressed = decompress_block(comp_data, sect.pack_type, dest_len)
-                except Exception:
-                    continue
+                decompressed = decompress_block(comp_data, sect.pack_type, dest_len)
             else:
                 dest_len = chain_len - skiplen
                 decompressed = raw_compressed[skiplen:skiplen + dest_len]
+            if not decompressed:
+                continue
             hptr = len(traversal_buf)
             traversal_buf.extend(decompressed)
             headptr[idx] = hptr
@@ -672,14 +805,10 @@ class FstReader:
                 tdelta = vli >> shcnt
             else:
                 tdelta = vli >> 1
-            scatterptr[idx] = tc_head[tdelta]
-            tc_head[tdelta] = idx + 1
-        initial_vals: list[tuple[int, bytes]] = []
-        frame_off = 0
-        for idx in range(max_handle):
-            sl = sig_lens[idx]
-            initial_vals.append((idx + 1, sect.frame_data[frame_off:frame_off + sl]))
-            frame_off += sl
+            if tdelta < len(times):
+                scatterptr[idx] = tc_head[tdelta]
+                tc_head[tdelta] = idx + 1
+
         if sect.beg_time != times[0]:
             yield (sect.beg_time, initial_vals)
         for ti in range(len(times)):
@@ -690,7 +819,7 @@ class FstReader:
                 sig_len = sig_lens[idx]
                 if sig_len <= 1:
                     if sig_len == 0:
-                        # variable-length string
+                        # variable-length string: (tdelta, length, bytes)
                         if not (vli & 1):
                             strlen, lskip2 = read_varint32(traversal_buf, headptr[idx] + skiplen)
                             raw_val = bytes(traversal_buf[headptr[idx] + skiplen + lskip2:headptr[idx] + skiplen + lskip2 + strlen])
@@ -700,7 +829,7 @@ class FstReader:
                             length_remaining[idx] -= consume
                             tc_head[ti] = scatterptr[idx]
                             scatterptr[idx] = 0
-                            if length_remaining[idx]:
+                            if length_remaining[idx] > 0:
                                 nv = peek_varint32(traversal_buf, headptr[idx])
                                 tdelta = nv >> 1
                                 next_ti = ti + tdelta
@@ -723,7 +852,7 @@ class FstReader:
                     length_remaining[idx] -= skiplen
                     tc_head[ti] = scatterptr[idx]
                     scatterptr[idx] = 0
-                    if length_remaining[idx]:
+                    if length_remaining[idx] > 0:
                         nv = peek_varint32(traversal_buf, headptr[idx])
                         if sig_len == 1:
                             shamt = 2 << (nv & 1)
@@ -752,7 +881,7 @@ class FstReader:
                     length_remaining[idx] -= skiplen + consume
                     tc_head[ti] = scatterptr[idx]
                     scatterptr[idx] = 0
-                    if length_remaining[idx]:
+                    if length_remaining[idx] > 0:
                         nv = peek_varint32(traversal_buf, headptr[idx])
                         tdelta = nv >> 1
                         next_ti = ti + tdelta
@@ -762,6 +891,11 @@ class FstReader:
                 changes.append((idx + 1, val))
             if changes:
                 yield (times[ti], changes)
+
+    def iter_time_value_pairs_all(self) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
+        """Yield time/value batches from all VCDATA sections in file order."""
+        for idx in range(len(self._vc_sections)):
+            yield from self.iter_time_value_pairs(idx)
 
     def summary(self) -> dict:
         return {

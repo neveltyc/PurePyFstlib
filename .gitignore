@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.fst
+
+# Debug/temp scripts
+debug_*.py
+fix_*.py
+patch_*.py
+test_write.py
+test_rt.py
+test_single.py
+test_multi.py
+test_read2.py
+pure_fst_reader.py
+add_chain.py
+
+# pylibfst reference
+pylibfst-0.2.1/
+pylibfst-0.2.1.tar.gz
+counter.fst
+transaction.fst

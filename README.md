@@ -260,6 +260,8 @@ python -c "import truepyfstlib; print(truepyfstlib.__version__)"
 
 ## Version history
 
+See [`CHANGELOG.md`](CHANGELOG.md).
+
 ---
 
 ## License

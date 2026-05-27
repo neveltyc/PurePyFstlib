@@ -524,6 +524,7 @@ class FstReader:
             vc_data = vc_data[cskip:]
         off = 0
         n = len(vc_data)
+        tidx = 0
         while off < n:
             vli, skiplen = read_varint(vc_data, off)
             off += skiplen
@@ -531,14 +532,16 @@ class FstReader:
                 if sig_len == 0:
                     break
                 if not (vli & 1):
-                    tdelta = vli >> 2
+                    shamt = 2 << (vli & 1)
+                    tidx += vli >> shamt
                     val_byte = ((vli >> 1) & 1) | 0x30
                 else:
-                    tdelta = vli >> 4
+                    shamt = 2 << (vli & 1)
+                    tidx += vli >> shamt
                     val_byte = FST_RCV_STR[((vli >> 1) & 7)]
                 val = bytes([val_byte])
             else:
-                tdelta = vli >> 1
+                tidx += vli >> 1
                 if not (vli & 1):
                     byte_len = (sig_len + 7) // 8
                     raw = bytearray(sig_len)
@@ -552,9 +555,9 @@ class FstReader:
                 else:
                     val = vc_data[off:off + sig_len]
                     off += sig_len
-            if tdelta >= len(times):
+            if tidx >= len(times):
                 break
-            yield (times[tdelta], val)
+            yield (times[tidx], val)
 
     def iter_time_value_pairs(
         self, section_index: int = 0,

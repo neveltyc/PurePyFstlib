@@ -241,29 +241,32 @@ class FstWriter:
                 handle_chunks[h] = b""
                 continue
             chunk = bytearray()
+            prev_tdelta = 0
             for rec in handle_records:
-                tdelta = times.index(rec.time_delta)
+                abs_tdelta = times.index(rec.time_delta)
+                cum_tdelta = abs_tdelta - prev_tdelta
+                prev_tdelta = abs_tdelta
                 if rec.is_string:
                     raw = rec.value
                     buf = bytearray()
-                    buf.extend(write_varint((tdelta << 1) | 0))
+                    buf.extend(write_varint((cum_tdelta << 1) | 0))
                     buf.extend(write_varint(len(raw)))
                     buf.extend(raw)
                     chunk.extend(buf)
                 elif vi.length <= 1:
                     val_byte = rec.value[0] if rec.value else 0x30
-                    if val_byte == 0x30 or val_byte == ord('0'):
-                        vli = (tdelta << 2)  # packed, bit=0
-                    elif val_byte == 0x31 or val_byte == ord('1'):
-                        vli = (tdelta << 2) | (1 << 1)  # packed, bit=1
+                    if val_byte == 0x30 or val_byte == ord("0"):
+                        vli = (cum_tdelta << 2)
+                    elif val_byte == 0x31 or val_byte == ord("1"):
+                        vli = (cum_tdelta << 2) | (1 << 1)
                     else:
                         idx = FST_RCV_STR.find(val_byte)
                         if idx < 0:
                             idx = 7
-                        vli = (tdelta << 4) | (1 << 1) | (idx << 1) | 1
+                        vli = (cum_tdelta << 4) | (1 << 1) | (idx << 1) | 1
                     chunk.extend(write_varint(vli))
                 else:
-                    chunk.extend(write_varint((tdelta << 1) | 1))
+                    chunk.extend(write_varint((cum_tdelta << 1) | 1))
                     chunk.extend(rec.value)
             handle_chunks[h] = bytes(chunk)
 

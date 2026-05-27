@@ -23,3 +23,6 @@ pylibfst-0.2.1/
 pylibfst-0.2.1.tar.gz
 counter.fst
 transaction.fst
+libfst/
+libfst.zip
+__MACOSX/

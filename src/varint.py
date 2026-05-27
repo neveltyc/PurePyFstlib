@@ -47,13 +47,28 @@ def read_varint64(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[in
 
 
 def read_svarint(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[int, int]:
-    """Read a signed varint (zig-zag encoded)."""
-    val, used = read_varint(buf, off)
-    # zig-zag decode
-    ret = val >> 1
-    if val & 1:
-        ret = -ret
-    return ret, used
+    """Read a signed varint (protobuf-style sign extension).
+
+    This is the encoding used by DYN_ALIAS2 chain tables.
+    Unlike zigzag, the MSB of the last 7-bit chunk determines sign.
+    """
+    value = 0
+    shift = 0
+    pos = off
+    last = 0
+    n = len(buf)
+    while True:
+        if pos >= n:
+            raise FstFormatError("truncated signed varint")
+        last = buf[pos]
+        pos += 1
+        value |= (last & 0x7F) << shift
+        shift += 7
+        if not (last & 0x80):
+            break
+    if shift < 64 and last & 0x40:
+        value |= -(1 << shift)
+    return value, pos - off
 
 
 def read_svarint64(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[int, int]:

@@ -501,6 +501,8 @@ class FstReader:
             return
 
         if chain_off <= 0 or chain_len <= 0:
+            if idx < len(self._signal_lengths) and not self._signal_lengths[idx]:
+                return  # string with no data: emit nothing (C reader behavior)
             yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
         payload = self._data

@@ -54,8 +54,6 @@ class FstWriter:
         version: str = "PurePyFstlib 0.1.0",
         date: str = "",
         filetype: int = FstFileType.VERILOG,
-        use_compressed_hier: bool = True,
-        pack_type: int = FstWriterPackType.ZLIB,
     ):
         self.path = Path(path)
         self.start_time = start_time
@@ -63,8 +61,6 @@ class FstWriter:
         self.version = version
         self.date = date or _time.strftime("%Y-%m-%d %H:%M:%S")
         self.filetype = filetype
-        self.use_compressed_hier = use_compressed_hier
-        self.pack_type = pack_type
         self._handle_counter = 0
         self._var_count = 0
         self._vars: dict[int, _VarInfo] = {}
@@ -330,10 +326,11 @@ class FstWriter:
             if not handle_records:
                 handle_chunks[h] = b""
                 continue
+            time_to_index = {t: i for i, t in enumerate(times)}
             chunk = bytearray()
             prev_tdelta = 0
             for rec in handle_records:
-                abs_tdelta = times.index(rec.time_delta)
+                abs_tdelta = time_to_index[rec.time_delta]
                 cum_tdelta = abs_tdelta - prev_tdelta
                 prev_tdelta = abs_tdelta
                 if rec.is_string:

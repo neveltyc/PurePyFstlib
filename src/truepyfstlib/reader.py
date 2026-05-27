@@ -279,6 +279,10 @@ class FstReader:
     def _parse_geometry_and_hierarchy(self) -> None:
         hier_data = self._extract_hierarchy()
         self._hierarchy_events = self._parse_hierarchy(hier_data)
+        # Precompute frame data prefix offsets for O(1) get_initial_value
+        self._frame_prefix: list[int] = [0]
+        for sl in self._signal_lengths:
+            self._frame_prefix.append(self._frame_prefix[-1] + sl)
 
     def _build_handle_map(self) -> None:
         """Build handle->FstVar lookup dict.
@@ -486,7 +490,7 @@ class FstReader:
         idx = handle - 1
         if idx < 0 or idx >= len(self._signal_lengths):
             raise IndexError(f"handle {handle} out of range")
-        off = sum(self._signal_lengths[:idx])
+        off = self._frame_prefix[idx]
         sig_len = self._signal_lengths[idx]
         return sect.frame_data[off:off + sig_len]
 

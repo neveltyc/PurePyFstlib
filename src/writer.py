@@ -250,14 +250,34 @@ class FstWriter:
         times = sorted(set(r.time_delta for r in all_records))
         max_handle = self._handle_counter
 
+        # frame_data layout per libfst convention (fstapi.c:5208-5350 reader,
+        # fstapi.c:2702-2714 writer):
+        #
+        #   string      (geom = 0xFFFFFFFF, sig_len = 0)  → 0 bytes
+        #   real        (geom = 0,           sig_len = 8) → 8 bytes (NaN)
+        #   N-bit wire  (geom = N,           sig_len = N) → N bytes (init "x"/"0")
+        #
+        # Previously every is_string OR length==0 var wrote exactly 1 byte,
+        # which misaligned every signal after a string. C reader still ran but
+        # fst2vcd's `b<chars>` output for the next multi-bit signal contained
+        # the stray 0x00 byte at offset 0, which truncates printf and silently
+        # drops subsequent dumpvars lines.
         frame_data = bytearray()
         for h in range(1, max_handle + 1):
             vi = self._vars.get(h)
             if vi is None:
+                # Unknown handle: treat as 1-bit wire with '0' initial.
                 frame_data.append(0x30)
-            elif vi.is_string or vi.length == 0:
-                frame_data.append(0)
+            elif vi.is_string:
+                # Strings have no initial value; contribute 0 bytes.
+                continue
+            elif vi.length == 0:
+                # Real (FST_VT_VCD_REAL): 8 bytes of NaN, like the C writer at
+                # fstapi.c:2711.  IEEE-754 double NaN = 7FF8000000000000 (BE).
+                frame_data.extend(b"\x7f\xf8\x00\x00\x00\x00\x00\x00")
             else:
+                # N-bit wire: write N ASCII '0' chars. C writer uses 'x'; '0'
+                # is also valid VCD and matches our existing convention.
                 frame_data.extend(b"0" * vi.length)
         frame_bytes = bytes(frame_data)
         frame_compressed = zlib.compress(frame_bytes)

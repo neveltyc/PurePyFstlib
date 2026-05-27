@@ -81,6 +81,7 @@ class FstWriter:
         self._blackouts: list[tuple[int, bool]] = []
         self._current_time: int = start_time
         self._section_begin_time: int = start_time
+        self._section_initial_values: dict[int, bytes] = {}
         self._end_time: int = start_time
         self._closed = False
         self._sections: list[_VcSection] = []
@@ -137,16 +138,19 @@ class FstWriter:
     def flush_context(self) -> None:
         if not self._vc_records:
             return
+        # frame_snapshot captures the section"s BEGINNING state
         self._sections.append(
             _VcSection(
                 records=list(self._vc_records),
                 begin_time=self._section_begin_time,
                 end_time=self._current_time,
-                frame_snapshot=dict(self._current_values),
+                frame_snapshot=dict(self._section_initial_values),
             )
         )
         self._vc_records.clear()
+        # Next section starts at current time, inheriting current values
         self._section_begin_time = self._current_time
+        self._section_initial_values = dict(self._current_values)
 
     def create_var(
         self,
@@ -170,6 +174,8 @@ class FstWriter:
                 raise ValueError("GEN_STRING variables must have length 0")
             is_string = True
             length = 0
+        if not is_string and length <= 0:
+            raise ValueError("non-string variables must have positive length")
         self._var_count += 1
         if alias_handle == 0:
             self._handle_counter += 1
@@ -182,9 +188,11 @@ class FstWriter:
             self._vars_by_handle.setdefault(handle, []).append(info)
             # init current value
             if is_string:
-                self._current_values[handle] = b""
+                initial = b""
             else:
-                self._current_values[handle] = b"0" * length
+                initial = b"0" * length
+            self._current_values[handle] = initial
+            self._section_initial_values[handle] = initial
         else:
             if alias_handle not in self._handle_info:
                 raise KeyError(f"unknown alias handle: {alias_handle}")
@@ -228,6 +236,8 @@ class FstWriter:
         return info
 
     def emit_value_change(self, handle: int, value: bytes) -> None:
+        if isinstance(value, str):
+            value = value.encode("utf-8")
         info = self._validate_handle(handle, value)
         is_string = info.is_string
         self._vc_records.append(_VcRecord(
@@ -257,7 +267,17 @@ class FstWriter:
                     records=list(self._vc_records),
                     begin_time=self._section_begin_time,
                     end_time=self._end_time,
-                    frame_snapshot=dict(self._current_values),
+                    frame_snapshot=dict(self._section_initial_values),
+                )
+            )
+        elif not self._sections and self._handle_counter > 0:
+            # No value changes but variables exist: create time-zero frame-only section
+            self._sections.append(
+                _VcSection(
+                    records=[],
+                    begin_time=self.start_time,
+                    end_time=self.start_time,
+                    frame_snapshot=dict(self._section_initial_values),
                 )
             )
         # vc_section_count

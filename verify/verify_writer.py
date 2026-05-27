@@ -154,9 +154,11 @@ def test_multi_section_state_inherited():
     w.set_scope(FstScopeType.VCD_MODULE, "top")
     h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s")
     w.set_upscope()
+    # Section 1: s=0 at t=10 (initial 0, no change at t=0)
     w.emit_time_change(10)
     w.emit_value_change(h, b"1")
     w.flush_context()
+    # Section 2: starts with s=1 (inherited from sec1 end), changes to 0 at t=20
     w.emit_time_change(20)
     w.emit_value_change(h, b"0")
     w.close()
@@ -164,6 +166,12 @@ def test_multi_section_state_inherited():
     assert len(r.vc_sections) == 2
     assert list(r.iter_value_changes(h, 0)) == [(10, b"1")]
     assert list(r.iter_value_changes(h, 1)) == [(20, b"0")]
+    # Verify section 1 initial frame = b"0" (section began at start_time=0 with s=0)
+    sec1_frame = r.get_initial_value(h, 0)
+    assert sec1_frame == b"0", f"sec1 initial frame expected b'0', got {sec1_frame!r}"
+    # Verify section 2 initial frame = b"1" (inherited from sec1 end)
+    sec2_frame = r.get_initial_value(h, 1)
+    assert sec2_frame == b"1", f"sec2 initial frame expected b'1', got {sec2_frame!r}"
     Path(path).unlink()
 
 
@@ -238,7 +246,7 @@ def test_attr_rejects_negative_type():
 
 
 def test_empty_file_has_vc_section():
-    """File with variables but no value changes must have vc_section_count=1."""
+    """File with variables but no value changes must have an actual VCDATA section."""
     with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
         path = f.name
     w = FstWriter(path, timescale=-9)
@@ -248,6 +256,7 @@ def test_empty_file_has_vc_section():
     w.close()
     r = FstReader(path)
     assert r.header.value_change_section_count == 1
+    assert len(r.vc_sections) == 1, f"expected 1 VCDATA section, got {len(r.vc_sections)}"
     Path(path).unlink()
 
 
@@ -272,6 +281,35 @@ def test_blackout_reader_exposes_intervals():
     Path(path).unlink()
 
 
+def test_zero_length_non_string_rejected():
+    """Non-string variables with length=0 must raise ValueError."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    try:
+        w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 0, "bad")
+        assert False, "should have raised"
+    except ValueError:
+        pass
+    Path(path).unlink()
+
+
+def test_emit_value_change_accepts_str():
+    """emit_value_change for string vars should accept Python str."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h = w.create_var(FstVarType.GEN_STRING, FstVarDir.IMPLICIT, 0, "msg")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change(h, "hello")  # str, not bytes
+    w.close()
+    r = FstReader(path)
+    assert list(r.iter_value_changes(h)) == [(0, b"hello")]
+    Path(path).unlink()
+
+
 def main():
     tests = [
         test_minimal, test_sparse, test_string_var, test_alias,
@@ -285,6 +323,8 @@ def main():
         test_attr_rejects_negative_type,
         test_empty_file_has_vc_section,
         test_blackout_reader_exposes_intervals,
+        test_zero_length_non_string_rejected,
+        test_emit_value_change_accepts_str,
     ]
     for t in tests:
         t()

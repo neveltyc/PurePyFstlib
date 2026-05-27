@@ -10,7 +10,7 @@ from pathlib import Path
 from truepyfstlib import FstReader, FstWriter
 from truepyfstlib.common import (
     FST_BL_GEOM, FstScopeType, FstVarDir, FstVarType,
-    FstAttrType, FstArrayType,
+    FstAttrType, FstArrayType, FstMiscType,
 )
 
 
@@ -206,6 +206,40 @@ def test_reader_attaches_sv_vhdl_metadata() -> None:
     assert var.supplemental_data_type == 6
     p.unlink(missing_ok=True)
 
+
+def test_reader_reports_unknown_attr_payload_as_text() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    # Third-party/vendor attributes may use printable text mixed with opaque
+    # non-ASCII bytes.  Reader should not guess semantics, but must preserve the
+    # original C-string bytes and expose report-safe textual forms.
+    payload = "vendor\x01\x7fÿ"
+    w.set_attr_begin(FstAttrType.MISC, FstMiscType.UNKNOWN, payload, 123)
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s")
+    w.set_attr_end()
+    w.set_upscope()
+    w.close()
+
+    r = FstReader(str(p))
+    attrs = r.attributes_for_handle(h)
+    assert len(attrs) == 1
+    raw = attrs[0].name_raw
+    assert raw.startswith(b"vendor\x01\x7f")
+    decoded = r.attributes_for_handle(h, decoded=True)[0]
+    payload_report = decoded["payload"]
+    assert payload_report["length"] == len(raw)
+    assert "vendor" in payload_report["ascii_escaped"]
+    assert "\\x01" in payload_report["ascii_escaped"]
+    assert "\\x7f" in payload_report["ascii_escaped"]
+    assert payload_report["hex"] == raw.hex()
+    assert payload_report["base64"]
+    assert decoded["payload_ascii"] == payload_report["ascii_escaped"]
+    report = r.attribute_report_text()
+    assert "vendor" in report and "hex=" in report
+    p.unlink(missing_ok=True)
+
 def main() -> None:
     tests = [
         test_reader_derives_geometry_from_hierarchy,
@@ -214,6 +248,7 @@ def main() -> None:
         test_reader_all_section_iteration,
         test_reader_blackout_semantic_filtering,
         test_reader_attaches_sv_vhdl_metadata,
+        test_reader_reports_unknown_attr_payload_as_text,
     ]
     for t in tests:
         t()

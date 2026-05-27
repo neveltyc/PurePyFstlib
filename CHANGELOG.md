@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3
+
+Attribute payload preservation and reporting:
+
+- FstAttrBegin.name_raw: raw C-string bytes preserved for third-party/
+  vendor attributes with opaque payloads
+- Unknown MISC attr subtypes are now preserved and attached to the next
+  variable (no semantic guessing, payload exposed via describe_attribute)
+- .attribute_payload(attr): safe textual views (ascii_escaped, hex, base64)
+- .attribute_report(decoded=): list of all attrs with payload readouts
+- .attribute_report_text(): human-readable text report of all hierarchy attrs
+- Helper: _escape_bytes_for_report, _attr_payload_bytes
+- New test: test_reader_reports_unknown_attr_payload_as_text
+
 ## 0.2.2
 
 Attribute introspection and VCD extension output:

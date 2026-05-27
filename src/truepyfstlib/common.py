@@ -365,6 +365,10 @@ class FstAttrBegin:
     name: str
     arg: int
     arg_from_name: int = 0
+    # Raw C-string bytes from the hierarchy attribute name/payload field.
+    # ``name`` is a text convenience view; ``name_raw`` preserves arbitrary
+    # third-party/vendor payload bytes for reporting or custom decoders.
+    name_raw: bytes = b""
 
 
 @dataclass(frozen=True)

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 import struct
 import zlib
+import base64
 
 from .common import (
     FstBlockType, FstHeader, FstScope, FstVar, FstUpscope,
@@ -310,6 +311,11 @@ class FstReader:
                     pending_metadata = _metadata_replace(
                         pending_metadata, source_instantiation_stem=stem
                     )
+            else:
+                # Preserve third-party/vendor MISC attrs and attach them to the
+                # next variable.  No semantic interpretation is attempted; the
+                # raw payload is exposed through describe_attribute().
+                pending_misc.append(attr)
 
         while off < n:
             tag = data[off]
@@ -345,7 +351,7 @@ class FstReader:
                     except Exception:
                         arg_from_name = 0
                 name = _decode_attr_name(name_raw, attr_type, subtype)
-                attr = FstAttrBegin(attr_type, subtype, name, arg, arg_from_name)
+                attr = FstAttrBegin(attr_type, subtype, name, arg, arg_from_name, name_raw)
                 events.append(attr)
                 self._attribute_events.append(attr)
                 if attr_type == int(FstAttrType.MISC):
@@ -721,8 +727,52 @@ class FstReader:
         return [self.describe_attribute(a) for a in attrs]
 
     def describe_attribute(self, attr: FstAttrBegin) -> dict:
-        """Decode one FST hierarchy attribute into a structured dictionary."""
+        """Decode one FST hierarchy attribute into a structured dictionary.
+
+        Tool-specific/unknown payloads are not semantically guessed.  They are
+        nevertheless reported losslessly through the ``payload`` field, which
+        contains safe ASCII/escaped/hex/base64 views of the raw hierarchy
+        attribute name/payload bytes.
+        """
         return _describe_attribute(attr, self._source_paths, self._enum_tables)
+
+    def attribute_payload(self, attr: FstAttrBegin) -> dict:
+        """Return safe textual views of one attribute's raw payload bytes."""
+        return _attribute_payload_report(attr)
+
+    def attribute_report(self, *, decoded: bool = True) -> list[dict]:
+        """Return a report-friendly list of all hierarchy attributes.
+
+        ``decoded=True`` includes category/subtype names plus payload readouts.
+        ``decoded=False`` returns a compact raw numeric report while still
+        including the escaped payload text.
+        """
+        if decoded:
+            return [self.describe_attribute(a) for a in self._attribute_events]
+        return [
+            {
+                "attr_type": int(a.attr_type),
+                "subtype": int(a.subtype),
+                "arg": int(a.arg),
+                "arg_from_name": int(a.arg_from_name),
+                "payload": _attribute_payload_report(a),
+            }
+            for a in self._attribute_events
+        ]
+
+    def attribute_report_text(self) -> str:
+        """Return a human-readable text report of all hierarchy attrs."""
+        lines: list[str] = []
+        for idx, attr in enumerate(self._attribute_events):
+            desc = self.describe_attribute(attr)
+            payload = desc["payload"]
+            lines.append(
+                f"[{idx}] {desc['attr_type_name']}/{desc['subtype_name']} "
+                f"arg={desc['arg']} payload={payload['ascii_escaped']}"
+            )
+            if payload["hex"]:
+                lines.append(f"    hex={payload['hex']}")
+        return "\n".join(lines)
 
     def iter_vcd_extension_lines(self) -> Iterator[str]:
         """Yield libfst-style VCD extension lines for hierarchy attributes.
@@ -1267,9 +1317,58 @@ def _fst_unescape(text: str) -> str:
     return out.decode("utf-8", errors="replace")
 
 
+
+def _attr_payload_bytes(attr: FstAttrBegin) -> bytes:
+    raw = getattr(attr, "name_raw", b"")
+    if raw:
+        return bytes(raw)
+    # Compatibility for FstAttrBegin instances constructed by older tests/users.
+    return str(attr.name).encode("utf-8", errors="replace")
+
+
+def _is_printable_ascii_byte(b: int) -> bool:
+    return 0x20 <= b <= 0x7E
+
+
+def _escape_bytes_for_report(raw: bytes) -> str:
+    """Return a reversible, report-friendly C-style escaped byte string."""
+    out: list[str] = []
+    for b in raw:
+        if b == 0x5C:  # backslash
+            out.append(r"\\")
+        elif b == 0x0A:
+            out.append(r"\n")
+        elif b == 0x0D:
+            out.append(r"\r")
+        elif b == 0x09:
+            out.append(r"\t")
+        elif b == 0x00:
+            out.append(r"\0")
+        elif _is_printable_ascii_byte(b):
+            out.append(chr(b))
+        else:
+            out.append(f"\\x{b:02x}")
+    return "".join(out)
+
+
+def _attribute_payload_report(attr: FstAttrBegin) -> dict:
+    raw = _attr_payload_bytes(attr)
+    printable = all(_is_printable_ascii_byte(b) or b in (0x09, 0x0A, 0x0D) for b in raw)
+    return {
+        "length": len(raw),
+        "ascii_escaped": _escape_bytes_for_report(raw),
+        "utf8": raw.decode("utf-8", errors="replace"),
+        "latin1": raw.decode("latin1", errors="replace"),
+        "hex": raw.hex(),
+        "base64": base64.b64encode(raw).decode("ascii"),
+        "is_printable_ascii": bool(printable),
+    }
+
+
 def _describe_attribute(attr: FstAttrBegin, source_paths: dict[int, str], enum_tables: dict[int, dict]) -> dict:
     attr_type = int(attr.attr_type)
     subtype = int(attr.subtype)
+    payload = _attribute_payload_report(attr)
     d = {
         "attr_type": attr_type,
         "attr_type_name": _ATTR_TYPE_NAMES.get(attr_type, f"attr_{attr_type}"),
@@ -1278,6 +1377,8 @@ def _describe_attribute(attr: FstAttrBegin, source_paths: dict[int, str], enum_t
         "name": attr.name,
         "arg": int(attr.arg),
         "arg_from_name": int(attr.arg_from_name),
+        "payload": payload,
+        "payload_ascii": payload["ascii_escaped"],
     }
     if attr_type == int(FstAttrType.MISC):
         if subtype == int(FstMiscType.SUPVAR):

@@ -81,7 +81,7 @@ class FstReader:
         FstVarType.SV_SHORTREAL,
     }
 
-    def __init__(self, path: str | Path, *, use_mmap: bool = False):
+    def __init__(self, path: str | Path, *, use_mmap: bool = True):
         self.path = Path(path)
         self._file = None
         self._mmap = None

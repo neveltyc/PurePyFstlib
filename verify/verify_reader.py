@@ -63,7 +63,15 @@ def test_reader_derives_geometry_from_hierarchy() -> None:
     assert r.signal_lengths[h3 - 1] == 0
     assert list(r.iter_value_changes(h2)) == [(0, b"1010")]
     assert list(r.iter_value_changes(h3)) == [(0, b"hello")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     stripped.unlink(missing_ok=True)
 
 
@@ -78,6 +86,10 @@ def test_reader_empty_section_iter_time_value_pairs() -> None:
     r = FstReader(str(p))
     batches = list(r.iter_time_value_pairs(0))
     assert batches == [(5, [(h, b"xx")])]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -96,6 +108,10 @@ def test_reader_decodes_real_values() -> None:
     assert math.isnan(init)
     changes = list(r.iter_decoded_value_changes(h))
     assert changes == [(10, 3.25)]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -117,6 +133,10 @@ def test_reader_all_section_iteration() -> None:
     r = FstReader(str(p))
     assert list(r.iter_value_changes_all(h)) == [(0, b"0"), (10, b"1"), (20, b"0")]
     assert list(r.iter_value_changes_all(h, include_initial=True))[0] == (0, b"x")
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -147,6 +167,10 @@ def test_reader_blackout_semantic_filtering() -> None:
     assert list(r.iter_blackout_intervals(0, 13)) == [(0, 5, True), (5, 10, False), (10, 13, True)]
     assert list(r.iter_value_changes(h)) == [(0, b"0"), (6, b"1"), (12, b"0")]
     assert list(r.iter_value_changes(h, respect_blackout=True)) == [(0, b"0"), (12, b"0")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -204,6 +228,10 @@ def test_reader_attaches_sv_vhdl_metadata() -> None:
     assert var.supplemental_type_name == "std_logic"
     assert var.supplemental_var_type == 1
     assert var.supplemental_data_type == 6
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -238,6 +266,10 @@ def test_reader_reports_unknown_attr_payload_as_text() -> None:
     assert decoded["payload_ascii"] == payload_report["ascii_escaped"]
     report = r.attribute_report_text()
     assert "vendor" in report and "hex=" in report
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 
@@ -260,6 +292,10 @@ def test_reader_mmap_context_manager_and_no_read_bytes_copy() -> None:
     r2 = FstReader(str(p), use_mmap=False)
     assert list(r2.iter_value_changes(h)) == [(0, b"1")]
     r2.close()
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     p.unlink(missing_ok=True)
 
 def main() -> None:

@@ -34,6 +34,7 @@ def test_single_bit_signal():
     assert changes[1] == (5, b"0")
     assert changes[2] == (10, b"1")
 
+    r.close()
     Path(path).unlink()
 
 
@@ -63,6 +64,7 @@ def test_multi_bit_signal():
     assert changes[1] == (10, b"0101")
     assert changes[2] == (20, b"1111")
 
+    r.close()
     Path(path).unlink()
 
 
@@ -93,6 +95,7 @@ def test_two_signals():
     sig2 = list(r.iter_value_changes(2))
     assert sig2 == [(0, b"00000000"), (15, b"10101010")]
 
+    r.close()
     Path(path).unlink()
 
 
@@ -118,6 +121,7 @@ def test_header_fields():
     assert "MySim" in h.version
     assert h.date == "2025-01-01"
 
+    r.close()
     Path(path).unlink()
 
 

@@ -49,6 +49,10 @@ def test_minimal():
     r = FstReader(path)
     changes = list(r.iter_value_changes(1))
     assert len(changes) == 2, f"got {changes}"
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -67,6 +71,10 @@ def test_sparse():
     _fst2vcd_ok(path)  # just ensure no crash
     r = FstReader(path)
     assert len(list(r.iter_value_changes(2))) == 1  # frame initial only
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -86,6 +94,10 @@ def test_string_var():
         assert "shello" in vcd and "sworld" in vcd
     r = FstReader(path)
     assert list(r.iter_value_changes(1)) == [(0, b"hello"), (10, b"world")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -105,6 +117,10 @@ def test_alias():
     assert r.header.max_handle == 1
     assert r.handle_to_var[1].name == "clk"
     assert len(r.vars_by_handle(1)) == 2
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -120,6 +136,10 @@ def test_handle_validation():
         w.emit_value_change(999, b"0")
         assert False, "should have raised"
     except KeyError:
+        pass
+    try:
+        r.close()
+    except (NameError, OSError):
         pass
     Path(path).unlink()
 
@@ -142,6 +162,10 @@ def test_alias_does_not_overwrite_canonical():
     assert r.signal_lengths[0] == 8
     changes = list(r.iter_value_changes(h))
     assert len(changes) == 1 and changes[0][1] == b"10101010"
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -157,6 +181,10 @@ def test_alias_unknown_handle_becomes_canonical():
     assert r.header.var_count == 1
     assert r.header.max_handle == 1
     assert r.handle_to_var[1].name == "sig"
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -186,6 +214,10 @@ def test_multi_section_state_inherited():
     # Verify section 2 initial frame = b"1" (inherited from sec1 end)
     sec2_frame = r.get_initial_value(h, 1)
     assert sec2_frame == b"1", f"sec2 initial frame expected b'1', got {sec2_frame!r}"
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -205,6 +237,10 @@ def test_flush_refuses_backwards_time():
         assert False, "should have raised"
     except ValueError:
         pass
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -222,6 +258,10 @@ def test_emit_bit_rejects_invalid():
             assert False, f"should have raised for {bad}"
         except ValueError:
             pass
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -238,6 +278,10 @@ def test_gen_string_auto_detect():
     w.close()
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == [(0, b"hello")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -252,6 +296,10 @@ def test_attr_invalid_values_are_normalized():
     w.close()
     r = FstReader(path)
     assert r.header.var_count == 1
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -267,6 +315,10 @@ def test_empty_file_has_vc_section():
     r = FstReader(path)
     assert r.header.value_change_section_count == 1
     assert len(r.vc_sections) == 1, f"expected 1 VCDATA section, got {len(r.vc_sections)}"
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -288,6 +340,10 @@ def test_blackout_reader_exposes_intervals():
     assert len(r.blackouts) == 2
     assert r.blackouts[0] == (0, False)
     assert r.blackouts[1] == (100, True)
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -300,6 +356,10 @@ def test_zero_length_non_string_rejected():
         w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 0, "bad")
         assert False, "should have raised"
     except ValueError:
+        pass
+    try:
+        r.close()
+    except (NameError, OSError):
         pass
     Path(path).unlink()
 
@@ -317,6 +377,10 @@ def test_emit_value_change_accepts_str():
     w.close()
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == [(0, b"hello")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 def test_empty_file_accepted_by_fst2vcd():
     """Empty file with variables must pass fst2vcd acceptance."""
@@ -329,6 +393,10 @@ def test_empty_file_accepted_by_fst2vcd():
     w.close()
     vcd = _fst2vcd_ok(path)
     assert "$var" in vcd
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -350,6 +418,10 @@ def test_xz_values_roundtrip():
     w.close()
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == expected
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -377,6 +449,10 @@ def test_nbit_vector_boundaries():
         changes = list(r.iter_value_changes(h))
         assert changes == [(0, val_a), (10, val_b), (20, val_a)], f"width={width}: {changes}"
         _fst2vcd_ok(path)
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
         Path(path).unlink()
 
 
@@ -396,6 +472,10 @@ def test_xz_in_multibit():
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == [(0, b"xxxxxxxx"), (10, b"zzzzzzzz")]
     _fst2vcd_ok(path)
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -426,6 +506,10 @@ def test_multisection_nbit_string_mixed():
     assert list(r.iter_value_changes(h2, 0)) == [(10, b"start")]
     assert list(r.iter_value_changes(h2, 1)) == [(30, b"end")]
     _fst2vcd_ok(path)
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -443,6 +527,10 @@ def test_hierarchy_frozen_after_first_emit():
         w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "b")
         assert False, "should have raised"
     except RuntimeError:
+        pass
+    try:
+        r.close()
+    except (NameError, OSError):
         pass
     Path(path).unlink()
 
@@ -468,6 +556,10 @@ def test_alias_mismatch_allowed_like_c_writer():
     assert vars_for_h[1].name == "data2"
     assert vars_for_h[1].length == 8
     assert list(r.iter_value_changes(h)) == [(0, b"1010")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -484,6 +576,10 @@ def test_close_then_mutate_rejected():
         w.emit_value_change(h, b"1")
         assert False, "should have raised"
     except RuntimeError:
+        pass
+    try:
+        r.close()
+    except (NameError, OSError):
         pass
     Path(path).unlink()
 
@@ -506,6 +602,10 @@ def test_close_then_time_flush_dump_rejected():
             assert False, "should have raised"
         except RuntimeError:
             pass
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 def main():
@@ -557,6 +657,10 @@ def test_real_writer_and_initial_value():
     assert r.signal_lengths[0] == 8
     assert r.signal_types[0] == FstVarType.VCD_REAL
     assert struct.unpack("<d", r.get_initial_value(h))[0] == 3.25
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -574,6 +678,10 @@ def test_numeric_helper_methods():
     r = FstReader(path)
     assert list(r.iter_value_changes(h1)) == [(0, b"1010")]
     assert list(r.iter_value_changes(h2)) == [(0, b"0001001010001001101010111100110111101111")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -588,6 +696,10 @@ def test_variable_length_value_change_string():
     w.close()
     r = FstReader(path)
     assert list(r.iter_value_changes(h)) == [(0, b"abc")]
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 
@@ -619,6 +731,10 @@ def test_misc_attr_and_timezero_helpers():
     assert any(a.subtype == 6 for a in attrs)
     assert any(a.subtype == 7 for a in attrs)
     assert h == 1
+    try:
+        r.close()
+    except (NameError, OSError):
+        pass
     Path(path).unlink()
 
 if __name__ == "__main__":

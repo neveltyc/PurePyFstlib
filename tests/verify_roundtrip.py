@@ -29,11 +29,10 @@ def test_single_bit_signal():
     changes = list(r.iter_value_changes(1))
 
     # Frame value at t=0 is b'0', then value change at t=0 sets to b'1'
-    assert len(changes) == 4
-    assert changes[0] == (0, b"0")   # initial
-    assert changes[1] == (0, b"1")   # change at time 0
-    assert changes[2] == (5, b"0")
-    assert changes[3] == (10, b"1")
+    assert len(changes) == 3
+    assert changes[0] == (0, b"1")
+    assert changes[1] == (5, b"0")
+    assert changes[2] == (10, b"1")
 
     Path(path).unlink()
 
@@ -59,11 +58,10 @@ def test_multi_bit_signal():
     r = FstReader(path)
     changes = list(r.iter_value_changes(1))
 
-    assert len(changes) == 4
+    assert len(changes) == 3
     assert changes[0] == (0, b"0000")
-    assert changes[1] == (0, b"0000")
-    assert changes[2] == (10, b"0101")
-    assert changes[3] == (20, b"1111")
+    assert changes[1] == (10, b"0101")
+    assert changes[2] == (20, b"1111")
 
     Path(path).unlink()
 
@@ -90,10 +88,10 @@ def test_two_signals():
     r = FstReader(path)
 
     sig1 = list(r.iter_value_changes(1))
-    assert sig1 == [(0, b"0"), (0, b"1"), (15, b"0")]
+    assert sig1 == [(0, b"1"), (15, b"0")]
 
     sig2 = list(r.iter_value_changes(2))
-    assert sig2 == [(0, b"00000000"), (0, b"00000000"), (15, b"10101010")]
+    assert sig2 == [(0, b"00000000"), (15, b"10101010")]
 
     Path(path).unlink()
 

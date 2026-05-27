@@ -497,14 +497,11 @@ class FstReader:
 
         # Negative chain_len: dynamic alias, return only the initial value
         if chain_len < 0:
-            initial = self.get_initial_value(handle, section_index)
-            yield (sect.beg_time, initial)
+            yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
 
-        initial = self.get_initial_value(handle, section_index)
-        yield (sect.beg_time, initial)
-
-        if chain_off < 0 or chain_len <= 0:
+        if chain_off <= 0 or chain_len <= 0:
+            yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
         payload = self._data
         vc_data_start = sect.block_offset + 9 + sect.vc_start

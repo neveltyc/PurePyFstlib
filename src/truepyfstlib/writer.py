@@ -116,6 +116,10 @@ class FstWriter:
 
     def set_attr_begin(self, attr_type: int, subtype: int,
                         name: str, arg: int = 0) -> None:
+        if not isinstance(attr_type, int) or attr_type < 0:
+            raise ValueError(f"attr_type must be non-negative int, got {attr_type!r}")
+        if not isinstance(subtype, int) or subtype < 0:
+            raise ValueError(f"subtype must be non-negative int, got {subtype!r}")
         buf = bytearray()
         buf.append(FST_ST_GEN_ATTRBEGIN)
         buf.append(attr_type)
@@ -161,6 +165,11 @@ class FstWriter:
             raise NotImplementedError(
                 "real-valued FST variables are not supported by writer yet"
             )
+        if var_type == FstVarType.GEN_STRING:
+            if is_string and length not in (0, None):
+                raise ValueError("GEN_STRING variables must have length 0")
+            is_string = True
+            length = 0
         self._var_count += 1
         if alias_handle == 0:
             self._handle_counter += 1

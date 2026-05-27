@@ -1,19 +1,20 @@
 """
 Pure-Python FST waveform reader.
 
-Supports:
-  - Block scanning (all block types)
-  - Header parsing
-  - Geometry block (signal lengths)
-  - Hierarchy block (scope/var tree, zlib/LZ4/LZ4DUO)
-  - VCDATA value-change traversal with interleaved time/value iteration
+Implemented:
+  Block types: HDR, VCDATA (static + DYN_ALIAS + DYN_ALIAS2),
+  GEOM (zlib), HIER (gzip/LZ4/LZ4DUO), ZWRAPPER, BLACKOUT (raw decode).
+  Hierarchy: scope/variable/upscope/attr_begin/attr_end.
+  VCDATA: frame + time table + chain index + per-handle value-change
+  iteration.  Pack types: zlib, LZ4, FastLZ.
+  Signal types: 1-bit, N-bit (packed binary or ASCII), string (varlen).
 
-Not yet implemented:
-  - Dynamic alias VCDATA blocks (VCDATA_DYN_ALIAS, VCDATA_DYN_ALIAS2)
-  - ZWRAPPER (whole-file gzip wrapper)
-  - Blackout sections
-  - Variable-length string type (FST_VT_GEN_STRING)
-  - Parallel/hier file support
+Not implemented:
+  Blackout semantic filtering in event iterators (raw intervals
+  are available via .blackouts).
+  Full SystemVerilog supplemental hierarchy metadata (enum tables,
+  source stems, packed/unpacked array subtypes).
+  Parallel .hier file support.
 """
 
 from __future__ import annotations

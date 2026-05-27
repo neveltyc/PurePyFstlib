@@ -92,7 +92,9 @@ class FstReader:
         self._signal_types: list[int] = []
         self._hierarchy_events: list = []
         self._vc_sections: list[VcSection] = []
+        self._handle_to_var: dict[int, 'FstVar'] = {}
         self._parse_geometry_and_hierarchy()
+        self._build_handle_map()
         self._parse_vc_sections()
 
     @staticmethod
@@ -277,6 +279,12 @@ class FstReader:
         hier_data = self._extract_hierarchy()
         self._hierarchy_events = self._parse_hierarchy(hier_data)
 
+    def _build_handle_map(self) -> None:
+        """Build handle->FstVar lookup dict."""
+        for e in self._hierarchy_events:
+            if isinstance(e, FstVar):
+                self._handle_to_var[e.handle] = e
+
     @staticmethod
     def _is_vc_block(b: FstBlock) -> bool:
         return b.block_type in FstReader.VCDATA_BLOCK_TYPES
@@ -444,6 +452,11 @@ class FstReader:
 
     def vars(self) -> list[FstVar]:
         return [e for e in self._hierarchy_events if isinstance(e, FstVar)]
+
+    @property
+    def handle_to_var(self) -> dict[int, 'FstVar']:
+        """Map signal handle (1-indexed) to FstVar."""
+        return self._handle_to_var
 
     def scopes(self) -> list[FstScope]:
         return [e for e in self._hierarchy_events if isinstance(e, FstScope)]

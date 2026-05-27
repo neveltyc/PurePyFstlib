@@ -150,7 +150,7 @@ class FstReader:
         off += FST_HDR_DATE_SIZE
         filetype = b[off] if off < len(b) else 0
         off += 1
-        timezero = _u64be(b, off) if off + 8 <= len(b) else 0
+        timezero = struct.unpack(">q", b[off:off + 8])[0] if off + 8 <= len(b) else 0
         return FstHeader(
             start_time=start_time, end_time=end_time,
             double_endian_match=double_endian_match,

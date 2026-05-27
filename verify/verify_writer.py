@@ -133,16 +133,18 @@ def test_alias_does_not_overwrite_canonical():
     Path(path).unlink()
 
 
-def test_alias_unknown_handle_rejected():
-    """Alias to non-existent handle must raise KeyError."""
+def test_alias_unknown_handle_becomes_canonical():
+    """Out-of-range alias handle follows fstapi.c: reset alias to 0."""
     with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
         path = f.name
     w = FstWriter(path, timescale=-9)
-    try:
-        w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "bad", alias_handle=999)
-        assert False, "should have raised"
-    except KeyError:
-        pass
+    h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "sig", alias_handle=999)
+    assert h == 1
+    w.close()
+    r = FstReader(path)
+    assert r.header.var_count == 1
+    assert r.header.max_handle == 1
+    assert r.handle_to_var[1].name == "sig"
     Path(path).unlink()
 
 
@@ -168,7 +170,7 @@ def test_multi_section_state_inherited():
     assert list(r.iter_value_changes(h, 1)) == [(20, b"0")]
     # Verify section 1 initial frame = b"0" (section began at start_time=0 with s=0)
     sec1_frame = r.get_initial_value(h, 0)
-    assert sec1_frame == b"0", f"sec1 initial frame expected b'0', got {sec1_frame!r}"
+    assert sec1_frame == b"x", f"sec1 initial frame expected b'x', got {sec1_frame!r}"
     # Verify section 2 initial frame = b"1" (inherited from sec1 end)
     sec2_frame = r.get_initial_value(h, 1)
     assert sec2_frame == b"1", f"sec2 initial frame expected b'1', got {sec2_frame!r}"
@@ -227,21 +229,17 @@ def test_gen_string_auto_detect():
     Path(path).unlink()
 
 
-def test_attr_rejects_negative_type():
-    """set_attr_begin must reject negative attr_type or subtype."""
+def test_attr_invalid_values_are_normalized():
+    """Invalid attr category/subtype are normalized like fstapi.c, not rejected."""
     with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
         path = f.name
     w = FstWriter(path, timescale=-9)
-    try:
-        w.set_attr_begin(-1, 0, "bad", 0)
-        assert False, "should have raised"
-    except ValueError:
-        pass
-    try:
-        w.set_attr_begin(0, -1, "bad", 0)
-        assert False, "should have raised"
-    except ValueError:
-        pass
+    w.set_attr_begin(-1, -1, "bad", 0)
+    w.set_attr_end()
+    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "sig")
+    w.close()
+    r = FstReader(path)
+    assert r.header.var_count == 1
     Path(path).unlink()
 
 
@@ -411,7 +409,7 @@ def test_multisection_nbit_string_mixed():
     w.close()
     r = FstReader(path)
     assert len(r.vc_sections) == 2
-    assert r.get_initial_value(h1, 0) == b"00000000"  # sec1 initial
+    assert r.get_initial_value(h1, 0) == b"xxxxxxxx"  # sec1 initial follows libfst
     assert r.get_initial_value(h1, 1) == b"10101010"  # sec2 initial inherited
     assert list(r.iter_value_changes(h2, 0)) == [(10, b"start")]
     assert list(r.iter_value_changes(h2, 1)) == [(30, b"end")]
@@ -437,24 +435,27 @@ def test_hierarchy_frozen_after_first_emit():
     Path(path).unlink()
 
 
-def test_alias_mismatch_rejected():
-    """Alias with mismatched type/length must raise ValueError."""
+def test_alias_mismatch_allowed_like_c_writer():
+    """Alias hierarchy metadata is kept permissive like fstapi.c."""
     with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
         path = f.name
     w = FstWriter(path, timescale=-9)
     w.set_scope(FstScopeType.VCD_MODULE, "top")
     h = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 4, "data")
+    w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 8, "data2", alias_handle=h)
     w.set_upscope()
-    try:
-        w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 4, "data2", alias_handle=h)
-        assert False, "should have raised for type mismatch"
-    except ValueError:
-        pass
-    try:
-        w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 8, "data2", alias_handle=h)
-        assert False, "should have raised for length mismatch"
-    except ValueError:
-        pass
+    w.emit_time_change(0)
+    w.emit_value_change(h, b"1010")
+    w.close()
+    r = FstReader(path)
+    assert r.header.var_count == 2
+    assert r.header.max_handle == 1
+    assert r.signal_lengths[0] == 4
+    vars_for_h = r.vars_by_handle(h)
+    assert len(vars_for_h) == 2
+    assert vars_for_h[1].name == "data2"
+    assert vars_for_h[1].length == 8
+    assert list(r.iter_value_changes(h)) == [(0, b"1010")]
     Path(path).unlink()
 
 
@@ -476,17 +477,36 @@ def test_close_then_mutate_rejected():
 
 
 
+
+
+def test_close_then_time_flush_dump_rejected():
+    """Lifecycle mutators after close should be rejected consistently."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "a")
+    w.set_upscope()
+    w.close()
+    for fn in (lambda: w.emit_time_change(1), lambda: w.flush_context(), lambda: w.emit_dump_active(True)):
+        try:
+            fn()
+            assert False, "should have raised"
+        except RuntimeError:
+            pass
+    Path(path).unlink()
+
 def main():
     tests = [
         test_minimal, test_sparse, test_string_var, test_alias,
         test_handle_validation,
         test_alias_does_not_overwrite_canonical,
-        test_alias_unknown_handle_rejected,
+        test_alias_unknown_handle_becomes_canonical,
         test_multi_section_state_inherited,
         test_flush_refuses_backwards_time,
         test_emit_bit_rejects_invalid,
         test_gen_string_auto_detect,
-        test_attr_rejects_negative_type,
+        test_attr_invalid_values_are_normalized,
         test_empty_file_has_vc_section,
         test_blackout_reader_exposes_intervals,
         test_zero_length_non_string_rejected,
@@ -497,14 +517,97 @@ def main():
         test_xz_in_multibit,
         test_multisection_nbit_string_mixed,
         test_hierarchy_frozen_after_first_emit,
-        test_alias_mismatch_rejected,
+        test_alias_mismatch_allowed_like_c_writer,
         test_close_then_mutate_rejected,
+        test_close_then_time_flush_dump_rejected,
+        test_real_writer_and_initial_value,
+        test_numeric_helper_methods,
+        test_variable_length_value_change_string,
+        test_misc_attr_and_timezero_helpers,
     ]
     for t in tests:
         t()
         print(f"OK   {t.__name__}")
     print(f"All {len(tests)} writer tests passed.")
 
+
+def test_real_writer_and_initial_value():
+    """Real-valued vars use geom=0 and 8-byte double payloads like fstapi.c."""
+    import struct
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    h = w.create_var(FstVarType.VCD_REAL, FstVarDir.IMPLICIT, 1, "r")
+    w.emit_value_change_real(h, 3.25)  # before time starts -> initial frame
+    w.emit_time_change(0)
+    w.close()
+    r = FstReader(path)
+    assert r.signal_lengths[0] == 8
+    assert r.signal_types[0] == FstVarType.VCD_REAL
+    assert struct.unpack("<d", r.get_initial_value(h))[0] == 3.25
+    Path(path).unlink()
+
+
+def test_numeric_helper_methods():
+    """32/64/vector helpers match fstapi.c helper bit ordering."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    h1 = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 4, "n4")
+    h2 = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 40, "v40")
+    w.emit_time_change(0)
+    w.emit_value_change32(h1, 4, 0b1010)
+    w.emit_value_change_vec32(h2, 40, [0x89ABCDEF, 0x12])
+    w.close()
+    r = FstReader(path)
+    assert list(r.iter_value_changes(h1)) == [(0, b"1010")]
+    assert list(r.iter_value_changes(h2)) == [(0, b"0001001010001001101010111100110111101111")]
+    Path(path).unlink()
+
+
+def test_variable_length_value_change_string():
+    """C-style variable-length value helper works for GEN_STRING."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    h = w.create_var(FstVarType.GEN_STRING, FstVarDir.IMPLICIT, 0, "msg")
+    w.emit_time_change(0)
+    w.emit_variable_length_value_change(h, "abcdef", 3)
+    w.close()
+    r = FstReader(path)
+    assert list(r.iter_value_changes(h)) == [(0, b"abc")]
+    Path(path).unlink()
+
+
+def test_misc_attr_and_timezero_helpers():
+    """C writer metadata helpers emit readable hierarchy attrs and signed timezero."""
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_timescale_from_string("100ps")
+    w.set_timezero(-7)
+    w.set_comment("hello\nworld")
+    w.set_env_var("A=B")
+    w.set_value_list("0 1 x z")
+    enum_h = w.create_enum_table("state", ["IDLE", "RUN"], ["0", "1"], min_valbits=2)
+    w.emit_enum_table_ref(enum_h)
+    h = w.create_var2(
+        FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "s",
+        type_name="std_logic",
+        supplemental_var_type=1,
+        supplemental_data_type=6,
+    )
+    w.close()
+    r = FstReader(path)
+    assert r.header.timescale == -10
+    assert r.header.timezero == -7
+    attrs = [e for e in r.hierarchy() if e.__class__.__name__ == "FstAttrBegin"]
+    assert any(a.subtype == 0 and "hello world" in a.name for a in attrs)
+    assert any(a.subtype == 1 and a.name == "A=B" for a in attrs)
+    assert any(a.subtype == 6 for a in attrs)
+    assert any(a.subtype == 7 for a in attrs)
+    assert h == 1
+    Path(path).unlink()
 
 if __name__ == "__main__":
     main()

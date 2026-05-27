@@ -22,7 +22,8 @@ from .common import (
     FST_ST_VCD_SCOPE, FST_ST_VCD_UPSCOPE,
     FST_HDR_SIM_VERSION_SIZE, FST_HDR_DATE_SIZE, FST_DOUBLE_ENDTEST,
     FST_RCV_STR,
-    FstVar, FstScope, FstFormatError,
+    FstVar, FstScope, FstFormatError, FstAttrType, FstMiscType,
+    FstSupplementalVarType, FstSupplementalDataType,
 )
 from .varint import write_varint
 
@@ -35,6 +36,7 @@ class _VarInfo:
     length: int
     alias_handle: int
     is_string: bool = False
+    is_real: bool = False
 
 
 @dataclass
@@ -70,6 +72,9 @@ class FstWriter:
         self.version = version
         self.date = date or _time.strftime("%Y-%m-%d %H:%M:%S")
         self.filetype = filetype
+        self.timezero: int = 0
+        self._max_enumhandle: int = 0
+        self._source_stems: dict[str, int] = {}
         self._handle_counter = 0
         self._var_count = 0
         self._vars_by_handle: dict[int, list[_VarInfo]] = {}
@@ -80,6 +85,7 @@ class FstWriter:
         self._vc_records: list[_VcRecord] = []
         self._blackouts: list[tuple[int, bool]] = []
         self._current_time: int = start_time
+        self._time_started: bool = False
         self._section_begin_time: int = start_time
         self._section_initial_values: dict[int, bytes] = {}
         self._hierarchy_frozen: bool = False
@@ -89,16 +95,57 @@ class FstWriter:
         self._current_values: dict[int, bytes] = {}
 
     def set_timescale(self, ts: int) -> None:
+        self._ensure_open()
         self.timescale = ts
 
     def set_version(self, version: str) -> None:
+        self._ensure_open()
         self.version = version
 
     def set_date(self, date: str) -> None:
+        self._ensure_open()
         self.date = date
 
     def set_file_type(self, ft: int) -> None:
+        self._ensure_open()
         self.filetype = ft
+
+    def set_timezero(self, tim: int) -> None:
+        """Set the FST header timezero field, matching fstWriterSetTimezero()."""
+        self._ensure_open()
+        self.timezero = int(tim)
+
+    def set_timescale_from_string(self, s: str) -> None:
+        """Parse VCD-style timescale text like '1ns', '10ps', or '100fs'."""
+        self._ensure_open()
+        text = str(s)
+        try:
+            tv = int(''.join(ch for ch in text if ch.isdigit()) or '0')
+        except ValueError:
+            tv = 0
+        seconds_exp = -9
+        for ch in text:
+            if ch == 'm':
+                seconds_exp = -3; break
+            if ch == 'u':
+                seconds_exp = -6; break
+            if ch == 'n':
+                seconds_exp = -9; break
+            if ch == 'p':
+                seconds_exp = -12; break
+            if ch == 'f':
+                seconds_exp = -15; break
+            if ch == 'a':
+                seconds_exp = -18; break
+            if ch == 'z':
+                seconds_exp = -21; break
+            if ch == 's':
+                seconds_exp = 0; break
+        if tv == 10:
+            seconds_exp += 1
+        elif tv == 100:
+            seconds_exp += 2
+        self.timescale = seconds_exp
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -113,6 +160,7 @@ class FstWriter:
             )
 
     def _freeze_hierarchy(self) -> None:
+        self._ensure_open()
         self._hierarchy_frozen = True
 
     def set_scope(self, scope_type: int, name: str, component: str = "") -> None:
@@ -136,10 +184,23 @@ class FstWriter:
     def set_attr_begin(self, attr_type: int, subtype: int,
                         name: str, arg: int = 0) -> None:
         self._check_hierarchy_open()
-        if not isinstance(attr_type, int) or attr_type < 0:
-            raise ValueError(f"attr_type must be non-negative int, got {attr_type!r}")
-        if not isinstance(subtype, int) or subtype < 0:
-            raise ValueError(f"subtype must be non-negative int, got {subtype!r}")
+        # Match libfst writer behavior: invalid attribute categories are
+        # normalized to MISC/UNKNOWN instead of rejected.  This keeps the
+        # Python writer permissive like fstapi.c while still producing a
+        # well-formed hierarchy record.
+        try:
+            attr_type = int(attr_type)
+        except (TypeError, ValueError):
+            attr_type = int(FstAttrType.MISC)
+        try:
+            subtype = int(subtype)
+        except (TypeError, ValueError):
+            subtype = 0
+        if attr_type < int(FstAttrType.MISC) or attr_type > int(FstAttrType.PACK):
+            attr_type = int(FstAttrType.MISC)
+            subtype = 8  # FST_MT_UNKNOWN
+        elif subtype < 0:
+            subtype = 0
         buf = bytearray()
         buf.append(FST_ST_GEN_ATTRBEGIN)
         buf.append(attr_type)
@@ -151,6 +212,99 @@ class FstWriter:
     def set_attr_end(self) -> None:
         self._check_hierarchy_open()
         self._hier_events.append(bytes([FST_ST_GEN_ATTREND]))
+
+    @staticmethod
+    def _sanitize_attr_text(text: str | None) -> str:
+        if text is None:
+            return ""
+        return str(text).replace("\n", " ").replace("\r", " ")
+
+    def _set_attr_generic(self, text: str | None, subtype: int, arg: int = 0) -> None:
+        # fstWriterSetAttrGeneric() emits MISC attributes and normalizes CR/LF
+        # to spaces.  It does not add a matching ATTREND.
+        self.set_attr_begin(FstAttrType.MISC, subtype, self._sanitize_attr_text(text), arg)
+
+    def _set_attr_double_arg_generic(self, subtype: int, arg1: int, arg2: int) -> None:
+        # fstapi.c encodes arg1 as a varint byte string used as attr name,
+        # then stores arg2 in the attr arg field.  The nul terminator is added
+        # by set_attr_begin().
+        name = write_varint(int(arg1)).decode("latin1") if arg1 else ""
+        self.set_attr_begin(FstAttrType.MISC, subtype, name, int(arg2))
+
+    def set_comment(self, comment: str) -> None:
+        self._set_attr_generic(comment, FstMiscType.COMMENT, 0)
+
+    def set_env_var(self, envvar: str) -> None:
+        self._set_attr_generic(envvar, FstMiscType.ENVVAR, 0)
+
+    def set_value_list(self, value_list: str) -> None:
+        self._set_attr_generic(value_list, FstMiscType.VALUELIST, 0)
+
+    def set_source_stem(self, path: str, line: int, use_realpath: bool = False) -> None:
+        self._set_source_stem(path, line, use_realpath, FstMiscType.SOURCESTEM)
+
+    def set_source_instantiation_stem(self, path: str, line: int, use_realpath: bool = False) -> None:
+        self._set_source_stem(path, line, use_realpath, FstMiscType.SOURCEISTEM)
+
+    def _set_source_stem(self, path: str, line: int, use_realpath: bool, subtype: int) -> None:
+        self._check_hierarchy_open()
+        if not path:
+            return
+        p = str(Path(path).resolve() if use_realpath else path)
+        sidx = self._source_stems.get(p)
+        if sidx is None:
+            sidx = len(self._source_stems) + 1
+            self._source_stems[p] = sidx
+            self._set_attr_generic(p, FstMiscType.PATHNAME, sidx)
+        self._set_attr_double_arg_generic(subtype, sidx, int(line))
+
+    @staticmethod
+    def _enum_escape(value: str) -> str:
+        # Lightweight equivalent for fstUtilityBinToEsc(): keep normal VCD-ish
+        # text readable and escape spaces/backslash/control bytes so the attr
+        # payload remains one whitespace-separated token.
+        out = []
+        for ch in str(value):
+            o = ord(ch)
+            if ch == "\\":
+                out.append("\\\\")
+            elif ch.isspace() or o < 32 or o >= 127:
+                out.append(f"\\x{o:02x}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    def create_enum_table(
+        self,
+        name: str,
+        literals: list[str] | tuple[str, ...],
+        values: list[str] | tuple[str, ...],
+        min_valbits: int = 0,
+    ) -> int:
+        """Create an enum-table hierarchy attribute and return its handle."""
+        self._check_hierarchy_open()
+        if not name or not literals or not values:
+            return 0
+        count = min(len(literals), len(values))
+        if count <= 0:
+            return 0
+        self._max_enumhandle += 1
+        parts = [str(name), str(count)]
+        for lit in literals[:count]:
+            parts.append(self._enum_escape(lit))
+        for val in values[:count]:
+            v = str(val)
+            if min_valbits > 0 and len(v) < min_valbits:
+                v = "0" * (min_valbits - len(v)) + v
+            parts.append(self._enum_escape(v))
+        self._set_attr_generic(" ".join(parts), FstMiscType.ENUMTABLE, self._max_enumhandle)
+        return self._max_enumhandle
+
+    def emit_enum_table_ref(self, handle: int) -> None:
+        if handle:
+            # Match fstWriterEmitEnumTableRef(): attr name is NULL/empty and arg
+            # is the enum table handle.
+            self.set_attr_begin(FstAttrType.MISC, FstMiscType.ENUMTABLE, "", int(handle))
 
     def emit_dump_active(self, enable: bool) -> None:
         self._freeze_hierarchy()
@@ -174,6 +328,22 @@ class FstWriter:
         self._section_begin_time = self._current_time
         self._section_initial_values = dict(self._current_values)
 
+    def create_var2(
+        self,
+        var_type: int,
+        direction: int,
+        length: int,
+        name: str,
+        alias_handle: int = 0,
+        type_name: str | None = "",
+        supplemental_var_type: int = FstSupplementalVarType.NONE,
+        supplemental_data_type: int = FstSupplementalDataType.NONE,
+    ) -> int:
+        """Create a var with VHDL/supplemental metadata, like fstWriterCreateVar2()."""
+        arg = (int(supplemental_var_type) << 10) | (int(supplemental_data_type) & 0x3FF)
+        self._set_attr_generic(type_name or "", FstMiscType.SUPVAR, arg)
+        return self.create_var(var_type, direction, length, name, alias_handle)
+
     def create_var(
         self,
         var_type: int,
@@ -188,10 +358,11 @@ class FstWriter:
             FstVarType.VCD_REAL, FstVarType.VCD_REAL_PARAMETER,
             FstVarType.VCD_REALTIME, FstVarType.SV_SHORTREAL,
         }
-        if var_type in REAL_TYPES:
-            raise NotImplementedError(
-                "real-valued FST variables are not supported by writer yet"
-            )
+        is_real = var_type in REAL_TYPES
+        if is_real:
+            # fstapi.c recasts all real-valued var types to an 8-byte double.
+            length = 8
+            is_string = False
         if var_type == FstVarType.GEN_STRING:
             if is_string and length not in (0, None):
                 raise ValueError("GEN_STRING variables must have length 0")
@@ -206,46 +377,57 @@ class FstWriter:
             info = _VarInfo(
                 var_type=var_type, direction=direction, name=name,
                 length=length, alias_handle=0, is_string=is_string,
+                is_real=is_real,
             )
             self._handle_info[handle] = info
             self._vars_by_handle.setdefault(handle, []).append(info)
             # init current value
             if is_string:
                 initial = b""
+            elif is_real:
+                # Header endian-test is written as little-endian, so real payloads
+                # are written little-endian as well.
+                initial = struct.pack("<d", float("nan"))
             else:
-                initial = b"0" * length
+                # libfst initializes fixed-width signals to 'x'.  Concrete
+                # reset/initial values should be emitted explicitly by the
+                # producer, usually at time zero.
+                initial = b"x" * length
             self._current_values[handle] = initial
             self._section_initial_values[handle] = initial
         else:
             if alias_handle not in self._handle_info:
-                raise KeyError(f"unknown alias handle: {alias_handle}")
-            base = self._handle_info[alias_handle]
-            if var_type != base.var_type:
-                raise ValueError(
-                    f"alias var_type ({var_type}) must match canonical ({base.var_type})"
+                # fstapi.c resets out-of-range alias handles to zero, turning
+                # the declaration into a new canonical signal.
+                alias_handle = 0
+                self._handle_counter += 1
+                handle = self._handle_counter
+                info = _VarInfo(
+                    var_type=var_type, direction=direction, name=name,
+                    length=length, alias_handle=0, is_string=is_string,
+                    is_real=is_real,
                 )
-            if length != base.length:
-                raise ValueError(
-                    f"alias length ({length}) must match canonical ({base.length})"
+                self._handle_info[handle] = info
+                self._vars_by_handle.setdefault(handle, []).append(info)
+                self._current_values[handle] = (b"" if is_string else (struct.pack("<d", float("nan")) if is_real else b"x" * length))
+                self._section_initial_values[handle] = self._current_values[handle]
+            else:
+                handle = alias_handle
+                # libfst writes the alias hierarchy entry with the caller's
+                # vt/vd/len but does not emit geometry or value storage for it.
+                # Keep canonical handle metadata untouched.
+                alias_info = _VarInfo(
+                    var_type=var_type, direction=direction, name=name,
+                    length=length, alias_handle=alias_handle,
+                    is_string=is_string, is_real=is_real,
                 )
-            if is_string != base.is_string:
-                raise ValueError(
-                    f"alias is_string ({is_string}) must match canonical ({base.is_string})"
-                )
-            handle = alias_handle
-            # Use canonical metadata, only name differs
-            alias_info = _VarInfo(
-                var_type=base.var_type, direction=direction, name=name,
-                length=base.length, alias_handle=alias_handle,
-                is_string=base.is_string,
-            )
-            self._vars_by_handle.setdefault(handle, []).append(alias_info)
+                self._vars_by_handle.setdefault(handle, []).append(alias_info)
         buf = bytearray()
         buf.append(var_type)
         buf.append(direction)
         buf.extend(name.encode("utf-8") + b"\x00")
         buf.extend(write_varint(length))
-        buf.extend(write_varint(0 if alias_handle == 0 else handle))
+        buf.extend(write_varint(alias_handle))
         self._hier_events.append(bytes(buf))
         return handle
 
@@ -253,6 +435,7 @@ class FstWriter:
         self._freeze_hierarchy()
         if time < self._current_time:
             raise ValueError("time must be monotonically increasing")
+        self._time_started = True
         self._current_time = time
         if time > self._end_time:
             self._end_time = time
@@ -275,16 +458,79 @@ class FstWriter:
         return info
 
     def emit_value_change(self, handle: int, value: bytes) -> None:
-        self._ensure_open()
-        if isinstance(value, str):
+        self._freeze_hierarchy()
+        info0 = self._handle_info.get(handle)
+        if info0 and info0.is_real and isinstance(value, (int, float)):
+            value = struct.pack("<d", float(value))
+        elif isinstance(value, str):
             value = value.encode("utf-8")
         info = self._validate_handle(handle, value)
         is_string = info.is_string
+        # fstapi.c treats fixed-width value changes before the first time
+        # change as updates to the section initial frame rather than explicit
+        # value-change records.  Variable-length/string records have no fixed
+        # frame storage, so keep them as ordinary records at start_time.
+        if not self._time_started and not is_string:
+            self._current_values[handle] = value
+            self._section_initial_values[handle] = value
+            return
         self._vc_records.append(_VcRecord(
             time_delta=self._current_time, handle=handle, value=value,
             is_string=is_string,
         ))
         self._current_values[handle] = value
+
+    def emit_variable_length_value_change(self, handle: int, value: bytes | str, length: int | None = None) -> None:
+        """Emit a variable-length value change, matching GEN_STRING usage in fstapi.c."""
+        self._freeze_hierarchy()
+        info = self._handle_info.get(handle)
+        if info is None:
+            return
+        # C writer ignores this call for fixed-width signals.
+        if not info.is_string:
+            return
+        if isinstance(value, str):
+            raw = value.encode("utf-8")
+        else:
+            raw = bytes(value)
+        if length is not None:
+            raw = raw[:int(length)]
+        self.emit_value_change(handle, raw)
+
+    def emit_value_change_real(self, handle: int, value: float) -> None:
+        self.emit_value_change(handle, struct.pack("<d", float(value)))
+
+    def emit_value_change32(self, handle: int, bits: int, value: int) -> None:
+        bits = int(bits)
+        mask = (1 << bits) - 1 if bits > 0 else 0
+        v = int(value) & mask
+        self.emit_value_change(handle, format(v, f"0{bits}b").encode("ascii"))
+
+    def emit_value_change64(self, handle: int, bits: int, value: int) -> None:
+        self.emit_value_change32(handle, bits, value)
+
+    def emit_value_change_vec32(self, handle: int, bits: int, values) -> None:
+        self._emit_value_change_vec(handle, bits, values, 32)
+
+    def emit_value_change_vec64(self, handle: int, bits: int, values) -> None:
+        self._emit_value_change_vec(handle, bits, values, 64)
+
+    def _emit_value_change_vec(self, handle: int, bits: int, values, word_bits: int) -> None:
+        bits = int(bits)
+        vals = list(values)
+        if bits <= word_bits:
+            self.emit_value_change32(handle, bits, vals[0] if vals else 0)
+            return
+        full_words = bits // word_bits
+        rem = bits & (word_bits - 1)
+        out = []
+        if rem:
+            top = vals[full_words] if full_words < len(vals) else 0
+            out.append(format(int(top) & ((1 << rem) - 1), f"0{rem}b"))
+        for w in range(full_words - 1, -1, -1):
+            val = vals[w] if w < len(vals) else 0
+            out.append(format(int(val) & ((1 << word_bits) - 1), f"0{word_bits}b"))
+        self.emit_value_change(handle, "".join(out).encode("ascii"))
 
     def emit_value_change_bit(self, handle: int, bit: int) -> None:
         self._ensure_open()
@@ -359,7 +605,7 @@ class FstWriter:
         date_bytes = self.date.encode("utf-8")[:FST_HDR_DATE_SIZE]
         buf.extend(date_bytes.ljust(FST_HDR_DATE_SIZE, b"\x00"))
         buf.append(self.filetype & 0xFF)
-        buf.extend(struct.pack(">Q", 0))
+        buf.extend(struct.pack(">Q", self.timezero & 0xFFFFFFFFFFFFFFFF))
         return bytes(buf)
 
     def _build_geometry_block(self) -> bytes:
@@ -381,7 +627,7 @@ class FstWriter:
                 geom_data.extend(write_varint(0xFFFFFFFF))  # unknown → treat as string
             elif vi.is_string:
                 geom_data.extend(write_varint(0xFFFFFFFF))
-            elif vi.length == 0:
+            elif vi.is_real:
                 geom_data.extend(write_varint(0))            # real
             else:
                 geom_data.extend(write_varint(vi.length))
@@ -423,8 +669,10 @@ class FstWriter:
                     if not vi.is_string:
                         frame_data.extend(val)
                 else:
-                    if not vi.is_string:
-                        frame_data.extend(b"0" * vi.length)
+                    if vi.is_real:
+                        frame_data.extend(struct.pack("<d", float("nan")))
+                    elif not vi.is_string:
+                        frame_data.extend(b"x" * vi.length)
             frame_bytes = bytes(frame_data)
             frame_compressed = zlib.compress(frame_bytes)
             block_body = bytearray()
@@ -493,9 +741,8 @@ class FstWriter:
                 # fstapi.c:2711.  IEEE-754 double NaN = 7FF8000000000000 (BE).
                 frame_data.extend(b"\x7f\xf8\x00\x00\x00\x00\x00\x00")
             else:
-                # N-bit wire: write N ASCII '0' chars. C writer uses 'x'; '0'
-                # is also valid VCD and matches our existing convention.
-                frame_data.extend(b"0" * vi.length)
+                # N-bit wire: libfst initializes fixed-width signals to 'x'.
+                frame_data.extend(b"x" * vi.length)
         frame_bytes = bytes(frame_data)
         frame_compressed = zlib.compress(frame_bytes)
 

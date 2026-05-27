@@ -130,6 +130,54 @@ def compare_events(fst_path: Path) -> tuple[int, int, list[str]]:
     return matched, len(mismatches), mismatches
 
 
+def _verify_writer_roundtrips() -> list[str]:
+    from truepyfstlib import FstWriter, FstReader
+    from truepyfstlib.common import FstScopeType, FstVarType, FstVarDir
+    import tempfile
+
+    failed = []
+    for fst_path in FST_FILES:
+        name = fst_path.stem
+        try:
+            r = FstReader(str(fst_path))
+            with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+                writer_path = tf.name
+            w = FstWriter(writer_path, start_time=r.header.start_time,
+                           timescale=r.header.timescale,
+                           version="golden-roundtrip")
+            # Replay: one scope, one var per handle, emit all changes
+            w.set_scope(FstScopeType.VCD_MODULE, "top")
+            for h in sorted(r.handle_to_var.keys()):
+                vi = r.handle_to_var[h]
+                w.create_var(vi.var_type, vi.direction, vi.length, vi.name,
+                              is_string=(vi.length == 0))
+            w.set_upscope()
+            # Emit in time order: group changes by time
+            events_by_time: dict[int, list[tuple[int, bytes]]] = {}
+            for h in sorted(r.handle_to_var.keys()):
+                for t, v in r.iter_value_changes(h):
+                    events_by_time.setdefault(t, []).append((h, v))
+            for t in sorted(events_by_time):
+                w.emit_time_change(t)
+                for h, v in events_by_time[t]:
+                    w.emit_value_change(h, v)
+            w.close()
+            # Verify fst2vcd accepts it
+            result = subprocess.run(
+                ["fst2vcd", "-f", writer_path],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                failed.append(f"{name} (fst2vcd rc={result.returncode})")
+            else:
+                print(f"OK   {name}: writer roundtrip accepted by fst2vcd")
+            Path(writer_path).unlink()
+        except Exception as e:
+            failed.append(f"{name} ({e})")
+    return failed
+
+
+
 def main():
     if not FST_FILES:
         print("No FST fixtures found. Run build.ps1 first.")
@@ -162,6 +210,13 @@ def main():
     print(f"Total: {total_matched} matched, {total_mismatched} mismatched")
     if failed_files:
         print(f"Failed: {failed_files}")
+        sys.exit(1)
+
+    # Writer roundtrip: for each fixture, reconstruct scenario with writer,
+    # verify fst2vcd accepts output.
+    writer_failed = _verify_writer_roundtrips()
+    if writer_failed:
+        print(f"Writer roundtrip failed: {writer_failed}")
         sys.exit(1)
     print("All golden tests passed.")
 

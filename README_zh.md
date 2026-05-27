@@ -12,6 +12,8 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT-3366cc?style=flat-square">
 </p>
 
+<p align="right"><a href="README.md">English</a></p>
+
 ---
 
 ## 为什么需要这个项目

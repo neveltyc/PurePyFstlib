@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1
+
+Bug fixes:
+
+- Fix chain table clobber in _parse_chain_table: pidx=-1 init prevents
+  skip entry lengths from being polluted when skip entries precede the
+  first real data entry (guards if pidx >= 0 in DYN_ALIAS2, non-DYN_ALIAS2,
+  and sentinel paths)
+- Defense layers: chain_off <= 0 guard in iter_time_value_pairs (match
+  single-handle version), empty comp_data skip before decompression
+- iter_value_changes_all with include_initial=True no longer duplicates
+  initial values for signals without VC records
+- test_empty_file_accepted_by_fst2vcd: add _HAS_FST2VCD guard, remove
+  stray r.close() try/except
+- varint.py docstring: LEAST -> MOST significant bits
+- writer.py: remove dead 'if False:' block in _build_vc_sections
+- reader.py: comp_body slice simplified to [cskip:]
+
 ## 0.4.0
 
 Stable info API and integration-friendly reader methods:

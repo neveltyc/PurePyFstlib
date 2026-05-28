@@ -729,10 +729,7 @@ class FstWriter:
                     continue
                 frame_data.extend(snap)
                 continue
-            if False:
-                pass  # dead, keep indent structure
-                # Unknown handle: treat as 1-bit wire with '0' initial.
-                frame_data.append(0x30)
+
             elif vi.is_string:
                 # Strings have no initial value; contribute 0 bytes.
                 continue

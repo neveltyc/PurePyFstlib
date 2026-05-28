@@ -16,7 +16,7 @@ def read_varint(buf: bytes | bytearray | memoryview, off: int = 0) -> tuple[int,
 
     FST varint format: bytes are stored with continuation bit (bit 7) set
     for all but the last byte. The LAST byte (without continuation bit)
-    contains the LEAST significant 7 bits. Reconstruction reads backwards
+    contains the MOST significant 7 bits. Reconstruction reads backwards
     from the last byte to the first.
     """
     start = off

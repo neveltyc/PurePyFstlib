@@ -627,7 +627,7 @@ class FstReader:
             times.append(tpval)
             off += used
         # Build O(1) lookup for cumulative time indices
-        self._time_to_index: dict[int, int] = {t: i for i, t in enumerate(times)}
+        # Per-section lookup (last section wins, unused externally)
         return times
 
     def _parse_chain_table(self, sect: VcSection, payload: bytes) -> None:
@@ -1454,7 +1454,10 @@ class FstReader:
         for section_index, sect in enumerate(self._vc_sections):
             if include_initial and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield sect.beg_time, self.get_initial_value(handle, section_index)
-            yield from self.iter_value_changes(handle, section_index, respect_blackout=respect_blackout)
+            yield from self.iter_value_changes(
+                handle, section_index, respect_blackout=respect_blackout,
+                _include_section_initial=not include_initial,
+            )
 
     def iter_decoded_value_changes_all(
         self, handle: int, *, include_initial: bool = False, respect_blackout: bool = False,
@@ -1537,7 +1540,7 @@ class FstReader:
         if comp_size:
             # Compressed data follows
             from .compression import decompress_block
-            comp_body = vc_data[cskip:cskip + chain_len]
+            comp_body = vc_data[cskip:]
             vc_data = decompress_block(comp_body, sect.pack_type, comp_size)
         else:
             # Uncompressed: skip the marker

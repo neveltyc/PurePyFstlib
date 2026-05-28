@@ -608,6 +608,26 @@ def test_close_then_time_flush_dump_rejected():
         pass
     Path(path).unlink()
 
+def test_include_initial_no_duplicate_for_unchanged_signal():
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as f:
+        path = f.name
+    w = FstWriter(path, timescale=-9)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    idle = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "idle")
+    w.set_upscope()
+    w.emit_value_change(idle, b"0")
+    w.emit_time_change(0)
+    w.emit_time_change(10)
+    w.emit_value_change(idle, b"1")
+    w.close()
+    r = FstReader(path)
+    changes = list(r.iter_value_changes_all(idle, include_initial=True))
+    assert changes == [(0, b"0"), (10, b"1")], f"unexpected {changes}"
+    r.close()
+    Path(path).unlink()
+
+
+
 def main():
     tests = [
         test_minimal, test_sparse, test_string_var, test_alias,
@@ -636,6 +656,7 @@ def main():
         test_numeric_helper_methods,
         test_variable_length_value_change_string,
         test_misc_attr_and_timezero_helpers,
+        test_include_initial_no_duplicate_for_unchanged_signal,
     ]
     for t in tests:
         t()

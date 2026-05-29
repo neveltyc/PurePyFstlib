@@ -51,6 +51,14 @@ from .varint import (
 from .compression import lz4_decompress
 
 
+# Lookup table mapping each byte value to its 8-character MSB-first ASCII bit
+# string (e.g. 0x05 -> b"00000101").  Used to expand packed binary value-change
+# data without a per-bit Python loop; concatenating the per-byte expansions and
+# slicing to the signal width reproduces the bit order the per-bit loop produced
+# (bits filled MSB-first, 8 per byte, last byte partially consumed).
+_BYTE_TO_BITS = tuple(format(b, "08b").encode("ascii") for b in range(256))
+
+
 @dataclass
 class VcSection:
     """Parsed value-change section metadata."""
@@ -1584,13 +1592,9 @@ class FstReader:
                 tidx += vli >> 1
                 if not (vli & 1):
                     byte_len = (sig_len + 7) // 8
-                    raw = bytearray(sig_len)
-                    for j in range(sig_len):
-                        bp = j // 8
-                        bit = 7 - (j & 7)
-                        ch = ((vc_data[off + bp] >> bit) & 1) | 0x30
-                        raw[j] = ch
-                    val = bytes(raw)
+                    val = b"".join(
+                        [_BYTE_TO_BITS[b] for b in vc_data[off:off + byte_len]]
+                    )[:sig_len]
                     off += byte_len
                 else:
                     val = bytes(vc_data[off:off + sig_len])
@@ -1735,13 +1739,11 @@ class FstReader:
                 else:
                     if not (vli & 1):
                         byte_len = (sig_len + 7) // 8
-                        raw = bytearray(sig_len)
-                        for j in range(sig_len):
-                            bp = j // 8
-                            bit = 7 - (j & 7)
-                            ch = ((traversal_buf[headptr[idx] + skiplen + bp] >> bit) & 1) | 0x30
-                            raw[j] = ch
-                        val = bytes(raw)
+                        base = headptr[idx] + skiplen
+                        val = b"".join(
+                            [_BYTE_TO_BITS[b]
+                             for b in traversal_buf[base:base + byte_len]]
+                        )[:sig_len]
                         consume = byte_len
                     else:
                         val = bytes(traversal_buf[headptr[idx] + skiplen:headptr[idx] + skiplen + sig_len])

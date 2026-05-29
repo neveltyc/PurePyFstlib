@@ -11,7 +11,10 @@ import sys
 from pathlib import Path
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
-FST_FILES = sorted(FIXTURES_DIR.glob("*.fst"))
+# bench.fst is a large benchmark fixture (generate-block hierarchy with repeated
+# leaf names + reals) that the leaf-name matcher here cannot disambiguate; it is
+# validated separately by verify_strict.py against full hierarchical paths.
+FST_FILES = sorted(p for p in FIXTURES_DIR.glob("*.fst") if p.stem != "bench")
 
 
 def parse_vcd_events(vcd_text: str) -> dict[tuple[int, str], str]:

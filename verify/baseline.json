@@ -1,0 +1,37 @@
+{
+  "fixture": "bench.fst",
+  "fixture_bytes": 430897,
+  "repeats": 5,
+  "results": {
+    "open_only": {
+      "median_s": 0.014883948000033342,
+      "min_s": 0.014419903999964845,
+      "count": 245,
+      "fingerprint": "c2f971df7efa717bcdaeb94c4ff00bb0"
+    },
+    "per_signal": {
+      "median_s": 0.7260592210000141,
+      "min_s": 0.7206400970000004,
+      "count": 186545,
+      "fingerprint": "79238deb6416386d762c3f5d8c9e9fb2"
+    },
+    "all_signals": {
+      "median_s": 0.8748099660000435,
+      "min_s": 0.8700292699999181,
+      "count": 186464,
+      "fingerprint": "a6c84570c87fe1b4b123c1eed174afcc"
+    },
+    "decoded_per_signal": {
+      "median_s": 0.8910442599999442,
+      "min_s": 0.8899966129999939,
+      "count": 186545,
+      "fingerprint": "05a1ea990f841dde97c6314b1fbd07a1"
+    },
+    "window_queries": {
+      "median_s": 8.248514800000066,
+      "min_s": 8.17830900599995,
+      "count": 7840,
+      "fingerprint": "1f376b34d9a3e1ec1b3e53cd26a1b237"
+    }
+  }
+}

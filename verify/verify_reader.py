@@ -436,6 +436,38 @@ def test_reader_stable_info_and_integration_api() -> None:
         pass
     p.unlink(missing_ok=True)
 
+
+def test_reader_values_are_bytes_not_memoryview() -> None:
+    """Regression: mmap-backed reads with an *uncompressed* frame must still
+    yield real ``bytes`` from iter_value_changes / get_initial_value, not a
+    memoryview into the mmap.  Tiny files keep the frame uncompressed
+    (uclen == clen), which previously leaked a memoryview and broke consumers
+    that call ``.decode()`` or expect ``bytes``.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    h1 = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "a")
+    h2 = w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 8, "v")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change_bit(h1, 1)
+    w.emit_value_change(h2, b"10101010")
+    w.close()
+
+    with FstReader(str(p)) as r:
+        for h in (h1, h2):
+            iv = r.get_initial_value(h)
+            assert isinstance(iv, bytes), (h, type(iv))
+            for _, val in r.iter_value_changes(h):
+                assert isinstance(val, bytes), (h, type(val))
+            for _, changes in r.iter_time_value_pairs(0):
+                for _, val in changes:
+                    assert isinstance(val, bytes), type(val)
+    p.unlink(missing_ok=True)
+
+
 def main() -> None:
     tests = [
         test_reader_derives_geometry_from_hierarchy,
@@ -448,6 +480,7 @@ def main() -> None:
         test_reader_mmap_context_manager_and_no_read_bytes_copy,
         test_reader_random_access_signal_and_time_window,
         test_reader_stable_info_and_integration_api,
+        test_reader_values_are_bytes_not_memoryview,
     ]
     for t in tests:
         t()

@@ -585,7 +585,10 @@ class FstReader:
             frame_raw = payload[off:off + frame_clen]
             off += frame_clen
             if frame_uclen == frame_clen:
-                sect.frame_data = frame_raw
+                # payload may be an mmap/memoryview slice; materialize as bytes
+                # so initial-value slices taken from frame_data honor the
+                # documented `-> bytes` contract (see get_initial_value).
+                sect.frame_data = bytes(frame_raw)
             else:
                 sect.frame_data = zlib.decompress(frame_raw)
             sect.vc_maxhandle, used4 = read_varint64(payload, off); off += used4
@@ -1590,7 +1593,7 @@ class FstReader:
                     val = bytes(raw)
                     off += byte_len
                 else:
-                    val = vc_data[off:off + sig_len]
+                    val = bytes(vc_data[off:off + sig_len])
                     off += sig_len
             if tidx >= len(times):
                 break

@@ -468,6 +468,58 @@ def test_reader_values_are_bytes_not_memoryview() -> None:
     p.unlink(missing_ok=True)
 
 
+def test_reader_get_value_at_cache_and_blackout() -> None:
+    """get_value_at uses a cached, bisected decode; verify it matches a
+    from-scratch linear scan for every signal at many time points, with and
+    without respect_blackout, and that repeated queries are consistent.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".fst", delete=False) as tf:
+        p = Path(tf.name)
+    w = FstWriter(p, start_time=0)
+    w.set_scope(FstScopeType.VCD_MODULE, "top")
+    hb = w.create_var(FstVarType.VCD_WIRE, FstVarDir.IMPLICIT, 1, "b")
+    hv = w.create_var(FstVarType.VCD_REG, FstVarDir.IMPLICIT, 5, "v")
+    w.set_upscope()
+    w.emit_time_change(0)
+    w.emit_value_change_bit(hb, 0)
+    w.emit_value_change(hv, b"00000")
+    w.emit_time_change(5)
+    w.emit_dump_active(False)
+    w.emit_time_change(6)
+    w.emit_value_change_bit(hb, 1)
+    w.emit_value_change(hv, b"10101")
+    w.emit_time_change(10)
+    w.emit_dump_active(True)
+    w.emit_time_change(12)
+    w.emit_value_change_bit(hb, 0)
+    w.emit_value_change(hv, b"11111")
+    w.close()
+
+    def brute(r, h, t, rb):
+        if rb and not r.is_dump_active_at(t):
+            return None
+        si = r.section_for_time(t)
+        if si is None:
+            return None
+        val = r.get_initial_value(h, si)
+        for et, ev in r.iter_value_changes(h, si, respect_blackout=rb,
+                                           _include_section_initial=False):
+            if et > t:
+                break
+            val = ev
+        return val
+
+    with FstReader(str(p)) as r:
+        for rb in (False, True):
+            for t in range(0, 14):
+                for h in (hb, hv):
+                    got = r.get_value_at(h, t, respect_blackout=rb)
+                    assert got == brute(r, h, t, rb), (h, t, rb, got)
+                    # second call (now cached) must agree with the first
+                    assert r.get_value_at(h, t, respect_blackout=rb) == got
+    p.unlink(missing_ok=True)
+
+
 def main() -> None:
     tests = [
         test_reader_derives_geometry_from_hierarchy,
@@ -481,6 +533,7 @@ def main() -> None:
         test_reader_random_access_signal_and_time_window,
         test_reader_stable_info_and_integration_api,
         test_reader_values_are_bytes_not_memoryview,
+        test_reader_get_value_at_cache_and_blackout,
     ]
     for t in tests:
         t()

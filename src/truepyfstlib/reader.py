@@ -21,6 +21,7 @@ Notes:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -150,6 +151,14 @@ class FstReader:
         self._parse_blackouts()
         self._blackout_times = [t for t, _ in self._blackouts]
         self._blackout_states = [a for _, a in self._blackouts]
+        # Bounded LRU cache of fully-decoded per-(section, handle) change
+        # streams: {(section_index, handle): (times_tuple, values_tuple)}.
+        # Decoding a chain re-slices, decompresses and walks every record, so
+        # repeated point/window queries on the same signal would otherwise
+        # redo that work each call.  Cache the raw change records (no blackout
+        # filtering; callers apply that) and bisect into them.
+        self._chain_cache: "OrderedDict[tuple[int, int], tuple]" = OrderedDict()
+        self._chain_cache_max = 4096
 
 
     @staticmethod
@@ -174,6 +183,11 @@ class FstReader:
         requires the underlying mmap/data to stay open.  Prefer using the
         reader as a context manager for large files.
         """
+        # Cached decoded chains are plain bytes (no mmap views), but drop them
+        # so a closed reader does not retain decoded waveform data.
+        cache = getattr(self, "_chain_cache", None)
+        if cache is not None:
+            cache.clear()
         if self._mmap is not None:
             try:
                 self._mmap.close()
@@ -1266,10 +1280,22 @@ class FstReader:
         if section_index is None:
             return None
         val = self.get_initial_value(h, section_index)
-        for et, ev in self.iter_value_changes(h, section_index, respect_blackout=respect_blackout):
-            if et > t:
-                break
-            val = ev
+        chain = self._decode_chain_full(section_index, h)
+        if chain is not None:
+            c_times, c_values = chain
+            if c_times:
+                # Index of the last change at time <= t.
+                pos = bisect.bisect_right(c_times, t)
+                if respect_blackout:
+                    # Walk back to the last active change at or before t.
+                    while pos > 0:
+                        ct = c_times[pos - 1]
+                        if self.is_dump_active_at(ct):
+                            val = c_values[pos - 1]
+                            break
+                        pos -= 1
+                elif pos > 0:
+                    val = c_values[pos - 1]
         return self.decode_value(h, val) if decoded else val
 
     def iter_value_changes_range(
@@ -1510,6 +1536,99 @@ class FstReader:
         sig_len = self._signal_lengths[idx]
         return sect.frame_data[off:off + sig_len]
 
+    def _decode_chain_full(self, section_index: int, handle: int):
+        """Return ``(times, values)`` for a handle's change records in a section.
+
+        This decodes only the value-change record stream (no synthetic initial
+        value, no blackout filtering, no alias/empty special-casing) and caches
+        the result in a bounded LRU so repeated point/window queries on the same
+        signal do not re-slice, re-decompress and re-walk the chain each time.
+        ``times`` and ``values`` are parallel tuples in file order; callers add
+        the initial value and apply blackout filtering as needed.
+
+        Returns ``None`` when the handle has no decodable chain in the section
+        (out of range, dynamic alias, or empty), so callers fall back to their
+        existing initial-value handling.
+        """
+        key = (section_index, handle)
+        cache = self._chain_cache
+        cached = cache.get(key)
+        if cached is not None:
+            cache.move_to_end(key)
+            return cached
+
+        sect = self._vc_sections[section_index]
+        idx = handle - 1
+        if idx >= len(sect.chain_table) or idx >= len(sect.chain_table_lengths):
+            return None
+        chain_off = sect.chain_table[idx]
+        chain_len = sect.chain_table_lengths[idx]
+        if chain_len < 0 or chain_off <= 0 or chain_len <= 0:
+            return None
+
+        vc_data_start = sect.block_offset + 9 + sect.vc_start
+        vc_data = self._data[vc_data_start + chain_off:vc_data_start + chain_off + chain_len]
+        sig_len = self._signal_lengths[idx]
+        times = sect.times
+        ntimes = len(times)
+
+        comp_size, cskip = read_varint(vc_data, 0)
+        if comp_size:
+            from .compression import decompress_block
+            vc_data = decompress_block(vc_data[cskip:], sect.pack_type, comp_size)
+        else:
+            vc_data = bytes(vc_data[cskip:])
+
+        out_times: list[int] = []
+        out_values: list[bytes] = []
+        ot_append = out_times.append
+        ov_append = out_values.append
+        off = 0
+        n = len(vc_data)
+        tidx = 0
+        rcv = FST_RCV_STR
+        tbl = _BYTE_TO_BITS
+        while off < n:
+            vli, skiplen = read_varint(vc_data, off)
+            off += skiplen
+            if sig_len == 0:
+                if vli & 1:
+                    break
+                tidx += vli >> 1
+                length, lskip = read_varint(vc_data, off)
+                off += lskip
+                val = bytes(vc_data[off:off + length])
+                off += length
+                if tidx >= ntimes:
+                    break
+                ot_append(times[tidx]); ov_append(val)
+                continue
+            if sig_len <= 1:
+                shamt = 2 << (vli & 1)
+                tidx += vli >> shamt
+                if not (vli & 1):
+                    val = b"0" if not ((vli >> 1) & 1) else b"1"
+                else:
+                    val = rcv[(vli >> 1) & 7:((vli >> 1) & 7) + 1]
+            else:
+                tidx += vli >> 1
+                if not (vli & 1):
+                    byte_len = (sig_len + 7) // 8
+                    val = b"".join([tbl[b] for b in vc_data[off:off + byte_len]])[:sig_len]
+                    off += byte_len
+                else:
+                    val = bytes(vc_data[off:off + sig_len])
+                    off += sig_len
+            if tidx >= ntimes:
+                break
+            ot_append(times[tidx]); ov_append(val)
+
+        result = (tuple(out_times), tuple(out_values))
+        cache[key] = result
+        if len(cache) > self._chain_cache_max:
+            cache.popitem(last=False)
+        return result
+
     def iter_value_changes(
         self, handle: int, section_index: int = 0, *, respect_blackout: bool = False,
         _include_section_initial: bool = True,
@@ -1541,68 +1660,18 @@ class FstReader:
             if _include_section_initial and (not respect_blackout or self.is_dump_active_at(sect.beg_time)):
                 yield (sect.beg_time, self.get_initial_value(handle, section_index))
             return
-        payload = self._data
-        vc_data_start = sect.block_offset + 9 + sect.vc_start
-        vc_data = payload[vc_data_start + chain_off:vc_data_start + chain_off + chain_len]
-        sig_len = self._signal_lengths[idx]
-        times = sect.times
 
-        # First varint: compressed size (0 = uncompressed)
-        comp_size, cskip = read_varint(vc_data, 0)
-        if comp_size:
-            # Compressed data follows
-            from .compression import decompress_block
-            comp_body = vc_data[cskip:]
-            vc_data = decompress_block(comp_body, sect.pack_type, comp_size)
+        decoded = self._decode_chain_full(section_index, handle)
+        if decoded is None:
+            return
+        c_times, c_values = decoded
+        if respect_blackout:
+            is_active = self.is_dump_active_at
+            for t, v in zip(c_times, c_values):
+                if is_active(t):
+                    yield (t, v)
         else:
-            # Uncompressed: skip the marker
-            vc_data = vc_data[cskip:]
-        off = 0
-        n = len(vc_data)
-        tidx = 0
-        while off < n:
-            vli, skiplen = read_varint(vc_data, off)
-            off += skiplen
-            if sig_len == 0:
-                # variable-length string: (tdelta, length, bytes)
-                if vli & 1:
-                    break  # unknown encoding
-                tidx += vli >> 1
-                length, lskip = read_varint(vc_data, off)
-                off += lskip
-                val = bytes(vc_data[off:off + length])
-                off += length
-                if tidx >= len(times):
-                    break
-                if not respect_blackout or self.is_dump_active_at(times[tidx]):
-                    yield (times[tidx], val)
-                continue
-            if sig_len <= 1:
-                # Single-bit: value encoded in vli
-                if not (vli & 1):
-                    shamt = 2 << (vli & 1)
-                    tidx += vli >> shamt
-                    val_byte = ((vli >> 1) & 1) | 0x30
-                else:
-                    shamt = 2 << (vli & 1)
-                    tidx += vli >> shamt
-                    val_byte = FST_RCV_STR[((vli >> 1) & 7)]
-                val = bytes([val_byte])
-            else:
-                tidx += vli >> 1
-                if not (vli & 1):
-                    byte_len = (sig_len + 7) // 8
-                    val = b"".join(
-                        [_BYTE_TO_BITS[b] for b in vc_data[off:off + byte_len]]
-                    )[:sig_len]
-                    off += byte_len
-                else:
-                    val = bytes(vc_data[off:off + sig_len])
-                    off += sig_len
-            if tidx >= len(times):
-                break
-            if not respect_blackout or self.is_dump_active_at(times[tidx]):
-                yield (times[tidx], val)
+            yield from zip(c_times, c_values)
 
     def iter_time_value_pairs(
         self, section_index: int = 0, *, respect_blackout: bool = False,
